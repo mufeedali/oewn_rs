@@ -250,49 +250,143 @@ impl WordNet {
 
     // --- Query Methods ---
 
-    /// Looks up lexical entries for a given lemma, optionally filtering by PartOfSpeech.
+    /// Looks up lexical entries (including pronunciations, senses, and sense relations) for a given lemma,
+    /// optionally filtering by PartOfSpeech, using a single optimized query.
     /// Returns owned LexicalEntry structs fetched from the DB.
     pub fn lookup_entries(
         &self,
         lemma: &str,
         pos_filter: Option<PartOfSpeech>,
     ) -> Result<Vec<LexicalEntry>> {
-        debug!("lookup_entries: lemma='{}', pos={:?}", lemma, pos_filter);
-        // Use Internal error for Mutex poisoning
+        debug!("lookup_entries (optimized): lemma='{}', pos={:?}", lemma, pos_filter);
         let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
-        let conn = &*conn_guard; // Dereference the guard
-
-        let sql = "
-            SELECT id, lemma_written_form, part_of_speech
-            FROM lexical_entries
-            WHERE lemma_written_form_lower = ?1 AND (?2 IS NULL OR part_of_speech = ?2)
-        ";
+        let conn = &*conn_guard;
 
         let pos_str_filter = pos_filter.map(db::part_of_speech_to_string);
 
+        // Single query joining entries, pronunciations, senses, and sense relations
+        // Filtered by lemma (lowercase) and optionally POS
+        let sql = "
+            SELECT
+                le.id AS entry_id, le.lemma_written_form, le.part_of_speech,
+                p.variety, p.notation, p.phonemic, p.audio, p.text AS pron_text,
+                s.id AS sense_id, s.synset_id, s.subcat,
+                sr.target_sense_id AS sense_rel_target, sr.rel_type AS sense_rel_type
+            FROM lexical_entries le
+            LEFT JOIN pronunciations p ON le.id = p.entry_id
+            LEFT JOIN senses s ON le.id = s.entry_id
+            LEFT JOIN sense_relations sr ON s.id = sr.source_sense_id -- Note: JOINING sense_relations on s.id, not le.id
+            WHERE le.lemma_written_form_lower = ?1 AND (?2 IS NULL OR le.part_of_speech = ?2)
+            ORDER BY le.id, s.id -- Order is crucial for grouping
+        ";
         let mut stmt = conn.prepare(sql)?;
-        let entry_ids_iter = stmt.query_map(
-            params![lemma.to_lowercase(), pos_str_filter],
-            |row| row.get::<_, String>(0), // Get just the ID
-        )?;
 
-        let mut entries = Vec::new();
-        for entry_id_result in entry_ids_iter {
-            let entry_id = entry_id_result?;
-            // Fetch the full entry details using the ID
-            match self.fetch_full_entry_by_id(conn, &entry_id)? {
-                Some(entry) => entries.push(entry),
-                None => warn!("Entry ID {} found in index but not fetchable.", entry_id),
+        // Use HashMaps to aggregate data during iteration
+        let mut entries_map: std::collections::HashMap<String, LexicalEntry> = std::collections::HashMap::new();
+        // Temporary storage for multi-valued fields, keyed by entry_id
+        let mut temp_pronunciations: std::collections::HashMap<String, std::collections::HashSet<Pronunciation>> = std::collections::HashMap::new();
+        // Temporary storage for senses, keyed by entry_id, then sense_id
+        let mut temp_senses: std::collections::HashMap<String, std::collections::HashMap<String, Sense>> = std::collections::HashMap::new();
+
+
+        let rows_iter = stmt.query_map(params![lemma.to_lowercase(), pos_str_filter], |row| {
+            // --- Extract Core Entry Data ---
+            let entry_id: String = row.get("entry_id")?;
+            let lemma_written_form: String = row.get("lemma_written_form")?;
+            let part_of_speech_str: String = row.get("part_of_speech")?;
+            let part_of_speech = string_to_part_of_speech(&part_of_speech_str)
+                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+
+            // --- Create or Get Entry in Map ---
+            // Prefix with _ as the variable itself isn't used directly after insertion/retrieval
+            let _entry_map_entry = entries_map.entry(entry_id.clone()).or_insert_with(|| LexicalEntry {
+                id: entry_id.clone(),
+                lemma: Lemma { written_form: lemma_written_form, part_of_speech },
+                pronunciations: Vec::new(),
+                senses: Vec::new(),
+                syntactic_behaviours: Vec::new(),
+            });
+
+            // --- Extract and Store Pronunciation ---
+            let pron_variety: Option<String> = row.get("variety")?;
+            if let Some(var) = pron_variety {
+                let pron_notation: Option<String> = row.get("notation")?;
+                let pron_phonemic_int: Option<i64> = row.get("phonemic")?;
+                let pron_audio: Option<String> = row.get("audio")?;
+                let pron_text: Option<String> = row.get("pron_text")?;
+                 if let (Some(ph_int), Some(txt)) = (pron_phonemic_int, pron_text) {
+                     temp_pronunciations.entry(entry_id.clone())
+                         .or_default()
+                         .insert(Pronunciation {
+                             variety: var,
+                             notation: pron_notation,
+                             phonemic: ph_int != 0,
+                             audio: pron_audio,
+                             text: txt,
+                         });
+                 } else {
+                      warn!("Incomplete pronunciation data found during lookup for entry {}", entry_id);
+                 }
+            }
+
+            // --- Extract and Store Sense and Sense Relation ---
+            let sense_id_opt: Option<String> = row.get("sense_id")?;
+            if let Some(sense_id) = sense_id_opt {
+                let synset_id: String = row.get("synset_id")?; // Should exist if sense_id exists
+                let subcat: Option<String> = row.get("subcat")?;
+                let sense_rel_target: Option<String> = row.get("sense_rel_target")?;
+                let sense_rel_type_str: Option<String> = row.get("sense_rel_type")?;
+
+                // Get or create the sense within the entry's sense map
+                 let entry_senses = temp_senses.entry(entry_id.clone()).or_default();
+                 let sense_entry = entry_senses.entry(sense_id.clone()).or_insert_with(|| Sense {
+                     id: sense_id.clone(),
+                     synset: synset_id,
+                     subcat: subcat,
+                     sense_relations: Vec::new(),
+                 });
+
+                // Add relation if present
+                if let (Some(target), Some(rel_str)) = (sense_rel_target, sense_rel_type_str) {
+                    let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e)) // Adjust index if needed
+                    })?;
+                    let new_relation = SenseRelation { target, rel_type };
+                    if !sense_entry.sense_relations.contains(&new_relation) {
+                        sense_entry.sense_relations.push(new_relation);
+                    }
+                }
+            }
+
+            Ok(())
+        })?;
+
+        // Consume iterator to process all rows
+        for result in rows_iter {
+            result?;
+        }
+
+        // Populate the final entries from the aggregated data
+        for (entry_id, entry) in entries_map.iter_mut() {
+            if let Some(prons) = temp_pronunciations.remove(entry_id) {
+                entry.pronunciations = prons.into_iter().collect();
+            }
+            if let Some(senses) = temp_senses.remove(entry_id) {
+                entry.senses = senses.into_values().collect();
+                // Sort senses by ID for consistent output (optional)
+                entry.senses.sort_by(|a, b| a.id.cmp(&b.id));
             }
         }
 
-        if entries.is_empty() {
+        let final_entries: Vec<LexicalEntry> = entries_map.into_values().collect();
+
+        if final_entries.is_empty() {
             debug!(
                 "No entries found for lemma '{}', pos_filter: {:?}",
                 lemma, pos_filter
             );
         }
-        Ok(entries)
+        Ok(final_entries)
     }
 
 
@@ -319,24 +413,64 @@ impl WordNet {
         self.fetch_senses_for_entry_internal(&*conn_guard, entry_id)
     }
 
-    /// Retrieves all Senses associated with a specific Synset ID.
+    /// Retrieves all Senses (including their relations) associated with a specific Synset ID using JOINs.
     /// Returns owned Sense structs fetched from the DB.
     pub fn get_senses_for_synset(&self, synset_id: &str) -> Result<Vec<Sense>> {
         let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
 
-        let mut stmt = conn.prepare("SELECT id FROM senses WHERE synset_id = ?1")?;
-        let sense_ids_iter = stmt.query_map(params![synset_id], |row| row.get::<_, String>(0))?;
+        let sql = "
+            SELECT
+                s.id, s.synset_id, s.subcat,
+                sr.target_sense_id, sr.rel_type
+            FROM senses s
+            LEFT JOIN sense_relations sr ON s.id = sr.source_sense_id
+            WHERE s.synset_id = ?1
+            ORDER BY s.id -- Important for grouping results by sense
+        ";
+        let mut stmt = conn.prepare(sql)?;
 
-        let mut senses = Vec::new();
-        for sense_id_result in sense_ids_iter {
-            let sense_id = sense_id_result?;
-            match self.fetch_full_sense_by_id(conn, &sense_id)? {
-                Some(sense) => senses.push(sense),
-                None => warn!("Sense ID {} found for synset {} but not fetchable.", sense_id, synset_id),
+        // Use a HashMap to group relations by sense ID during iteration
+        let mut senses_map: std::collections::HashMap<String, Sense> = std::collections::HashMap::new();
+
+        let rows_iter = stmt.query_map(params![synset_id], |row| {
+            // Extract data from the row
+            let sense_id: String = row.get(0)?;
+            let current_synset_id: String = row.get(1)?; // Should match input synset_id
+            let subcat: Option<String> = row.get(2)?;
+            let target_sense_id: Option<String> = row.get(3)?;
+            let rel_type_str: Option<String> = row.get(4)?;
+
+            // Create or get the Sense struct from the map
+            let sense_entry = senses_map.entry(sense_id.clone()).or_insert_with(|| Sense {
+                id: sense_id.clone(),
+                synset: current_synset_id, // Use the value from the row
+                subcat: subcat,
+                sense_relations: Vec::new(), // Initialize relations vector
+            });
+
+            // If relation data exists (due to LEFT JOIN), parse and add it
+            if let (Some(target), Some(rel_str)) = (target_sense_id, rel_type_str) {
+                let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                // Avoid adding duplicate relations if a sense has multiple relations of the same type to the same target
+                let new_relation = SenseRelation { target, rel_type };
+                if !sense_entry.sense_relations.contains(&new_relation) {
+                    sense_entry.sense_relations.push(new_relation);
+                }
             }
+
+            Ok(()) // query_map expects a Result, Ok(()) indicates success for this row processing
+        })?;
+
+        // Consume the iterator to process all rows and populate the map
+        for result in rows_iter {
+            result?; // Propagate any error
         }
-        Ok(senses)
+
+        // Convert the map values (Senses) into a Vec
+        Ok(senses_map.into_values().collect())
     }
 
     /// Retrieves a random lexical entry.
@@ -356,27 +490,136 @@ impl WordNet {
         }
     }
 
-    /// Returns an iterator over all lexical entries in the WordNet data.
-    /// Note: This is potentially very inefficient as it fetches *all* entries and their related data.
-    /// Use with caution or consider alternative approaches like iterators if needed for large-scale processing.
+    /// Retrieves all lexical entries (including pronunciations, senses, and sense relations) using a single optimized query.
+    /// Note: This fetches the entire dataset into memory and can be very resource-intensive. Use with caution.
     /// Returns owned LexicalEntry structs fetched from the DB.
     pub fn all_entries(&self) -> Result<Vec<LexicalEntry>> {
-        warn!("all_entries() called: Fetching all entries from DB, this might be slow and memory-intensive.");
+        warn!("all_entries() (optimized) called: Fetching all entries and related data from DB. This might be slow and very memory-intensive.");
         let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
 
-        let mut stmt = conn.prepare("SELECT id FROM lexical_entries")?;
-        let entry_ids_iter = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        // Single query joining entries, pronunciations, senses, and sense relations for ALL entries
+        let sql = "
+            SELECT
+                le.id AS entry_id, le.lemma_written_form, le.part_of_speech,
+                p.variety, p.notation, p.phonemic, p.audio, p.text AS pron_text,
+                s.id AS sense_id, s.synset_id, s.subcat,
+                sr.target_sense_id AS sense_rel_target, sr.rel_type AS sense_rel_type
+            FROM lexical_entries le
+            LEFT JOIN pronunciations p ON le.id = p.entry_id
+            LEFT JOIN senses s ON le.id = s.entry_id
+            LEFT JOIN sense_relations sr ON s.id = sr.source_sense_id
+            ORDER BY le.id, s.id -- Order is crucial for grouping
+        ";
+        let mut stmt = conn.prepare(sql)?;
 
-        let mut entries = Vec::new();
-        for entry_id_result in entry_ids_iter {
-             let entry_id = entry_id_result?;
-             match self.fetch_full_entry_by_id(conn, &entry_id)? {
-                 Some(entry) => entries.push(entry),
-                 None => warn!("Entry ID {} found in all_entries query but not fetchable.", entry_id),
-             }
+        // Use HashMaps to aggregate data during iteration
+        let mut entries_map: std::collections::HashMap<String, LexicalEntry> = std::collections::HashMap::new();
+        // Temporary storage for multi-valued fields, keyed by entry_id
+        let mut temp_pronunciations: std::collections::HashMap<String, std::collections::HashSet<Pronunciation>> = std::collections::HashMap::new();
+        // Temporary storage for senses, keyed by entry_id, then sense_id
+        let mut temp_senses: std::collections::HashMap<String, std::collections::HashMap<String, Sense>> = std::collections::HashMap::new();
+
+        let rows_iter = stmt.query_map([], |row| { // No parameters needed for all_entries
+            // --- Extract Core Entry Data ---
+            let entry_id: String = row.get("entry_id")?;
+            let lemma_written_form: String = row.get("lemma_written_form")?;
+            let part_of_speech_str: String = row.get("part_of_speech")?;
+            let part_of_speech = string_to_part_of_speech(&part_of_speech_str)
+                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+
+            // --- Create or Get Entry in Map ---
+             // Prefix with _ as the variable itself isn't used directly after insertion/retrieval
+            let _entry_map_entry = entries_map.entry(entry_id.clone()).or_insert_with(|| LexicalEntry {
+                id: entry_id.clone(),
+                lemma: Lemma { written_form: lemma_written_form, part_of_speech },
+                pronunciations: Vec::new(),
+                senses: Vec::new(),
+                syntactic_behaviours: Vec::new(),
+            });
+
+            // --- Extract and Store Pronunciation ---
+            let pron_variety: Option<String> = row.get("variety")?;
+            if let Some(var) = pron_variety {
+                let pron_notation: Option<String> = row.get("notation")?;
+                let pron_phonemic_int: Option<i64> = row.get("phonemic")?;
+                let pron_audio: Option<String> = row.get("audio")?;
+                let pron_text: Option<String> = row.get("pron_text")?;
+                 if let (Some(ph_int), Some(txt)) = (pron_phonemic_int, pron_text) {
+                     temp_pronunciations.entry(entry_id.clone())
+                         .or_default()
+                         .insert(Pronunciation {
+                             variety: var,
+                             notation: pron_notation,
+                             phonemic: ph_int != 0,
+                             audio: pron_audio,
+                             text: txt,
+                         });
+                 } else {
+                      warn!("Incomplete pronunciation data found during all_entries for entry {}", entry_id);
+                 }
+            }
+
+            // --- Extract and Store Sense and Sense Relation ---
+            let sense_id_opt: Option<String> = row.get("sense_id")?;
+            if let Some(sense_id) = sense_id_opt {
+                let synset_id: String = row.get("synset_id")?; // Should exist if sense_id exists
+                let subcat: Option<String> = row.get("subcat")?;
+                let sense_rel_target: Option<String> = row.get("sense_rel_target")?;
+                let sense_rel_type_str: Option<String> = row.get("sense_rel_type")?;
+
+                // Get or create the sense within the entry's sense map
+                 let entry_senses = temp_senses.entry(entry_id.clone()).or_default();
+                 let sense_entry = entry_senses.entry(sense_id.clone()).or_insert_with(|| Sense {
+                     id: sense_id.clone(),
+                     synset: synset_id,
+                     subcat: subcat,
+                     sense_relations: Vec::new(),
+                 });
+
+                // Add relation if present
+                if let (Some(target), Some(rel_str)) = (sense_rel_target, sense_rel_type_str) {
+                    let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e)) // Adjust index if needed
+                    })?;
+                    let new_relation = SenseRelation { target, rel_type };
+                    if !sense_entry.sense_relations.contains(&new_relation) {
+                        sense_entry.sense_relations.push(new_relation);
+                    }
+                }
+            }
+
+            Ok(())
+        })?;
+
+        // Consume iterator to process all rows
+        info!("Processing rows for all_entries..."); // Add info log
+        let mut row_count = 0;
+        for result in rows_iter {
+            result?;
+            row_count += 1;
+            if row_count % 100000 == 0 { // Log progress periodically
+                 info!("Processed {} rows for all_entries...", row_count);
+            }
         }
-        Ok(entries)
+         info!("Finished processing {} rows for all_entries.", row_count);
+
+
+        // Populate the final entries from the aggregated data
+        info!("Aggregating final entry data...");
+        for (entry_id, entry) in entries_map.iter_mut() {
+            if let Some(prons) = temp_pronunciations.remove(entry_id) {
+                entry.pronunciations = prons.into_iter().collect();
+            }
+            if let Some(senses) = temp_senses.remove(entry_id) {
+                entry.senses = senses.into_values().collect();
+                // Sort senses by ID for consistent output (optional)
+                entry.senses.sort_by(|a, b| a.id.cmp(&b.id));
+            }
+        }
+        info!("Aggregation complete.");
+
+        Ok(entries_map.into_values().collect())
     }
 
     // --- Public Helper Methods ---
@@ -396,94 +639,132 @@ impl WordNet {
         self.fetch_full_entry_by_id(&*conn_guard, entry_id)
     }
 
-    /// Internal helper to fetch full LexicalEntry data including relations.
+    /// Internal helper to fetch full LexicalEntry data including pronunciations and senses.
+    /// Fetches entry + pronunciations with JOIN, then calls optimized sense fetcher.
     fn fetch_full_entry_by_id(&self, conn: &Connection, entry_id: &str) -> Result<Option<LexicalEntry>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, lemma_written_form, part_of_speech FROM lexical_entries WHERE id = ?1",
-        )?;
-        let entry_opt = stmt.query_row(params![entry_id], |row| {
-            // Explicitly map OewnError from helpers to rusqlite::Error within the closure
-            let entry_id_str: String = row.get(0)?;
-            // row_to_lemma already returns rusqlite::Error on failure
-            let lemma = row_to_lemma(row)?;
+        let sql = "
+            SELECT
+                le.id, le.lemma_written_form, le.part_of_speech,
+                p.variety, p.notation, p.phonemic, p.audio, p.text AS pron_text
+            FROM lexical_entries le
+            LEFT JOIN pronunciations p ON le.id = p.entry_id
+            WHERE le.id = ?1
+        ";
+        let mut stmt = conn.prepare(sql)?;
 
-            // Call helper and map error if it occurs
-            let pronunciations = self.fetch_pronunciations_for_entry(conn, &entry_id_str)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?; // Use Text type for clarity
-            let senses = self.fetch_senses_for_entry_internal(conn, &entry_id_str)
-                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?; // Use Text type for clarity
+        let mut entry_opt: Option<LexicalEntry> = None;
+        let mut pronunciations_temp: std::collections::HashSet<Pronunciation> = std::collections::HashSet::new(); // Use HashSet for uniqueness
 
-            Ok(LexicalEntry {
-                id: entry_id_str,
-                lemma,
-                pronunciations,
-                senses,
-                syntactic_behaviours: Vec::new(), // TODO: Fetch if needed
-            })
-        }).optional()?; // Use optional() to handle not found case
+        let rows_iter = stmt.query_map(params![entry_id], |row| {
+            // Extract core entry data (only needed once)
+            if entry_opt.is_none() {
+                let id: String = row.get(0)?;
+                let lemma = row_to_lemma(row)?; // Uses cols 1 and 2
+
+                entry_opt = Some(LexicalEntry {
+                    id: id.clone(),
+                    lemma,
+                    pronunciations: Vec::new(), // Initialize
+                    senses: Vec::new(),         // Initialize
+                    syntactic_behaviours: Vec::new(), // TODO: Fetch if needed
+                });
+            }
+
+            // Extract pronunciation data (if present in this row)
+            let variety: Option<String> = row.get(3)?;
+            if let Some(var) = variety { // Check if pronunciation exists for this row
+                let notation: Option<String> = row.get(4)?;
+                let phonemic_int: Option<i64> = row.get(5)?;
+                let audio: Option<String> = row.get(6)?;
+                let text: Option<String> = row.get(7)?; // Renamed to pron_text in SQL
+
+                // Ensure required fields are present (variety and text should be NOT NULL in schema ideally)
+                 if let (Some(ph_int), Some(txt)) = (phonemic_int, text) {
+                     pronunciations_temp.insert(Pronunciation {
+                         variety: var,
+                         notation,
+                         phonemic: ph_int != 0,
+                         audio,
+                         text: txt,
+                     });
+                 } else {
+                      warn!("Incomplete pronunciation data found for entry {}", entry_id);
+                 }
+            }
+            Ok(())
+        })?;
+
+        // Consume iterator
+        for result in rows_iter {
+            result?;
+        }
+
+        // If an entry was found, assign pronunciations and fetch senses
+        if let Some(entry) = entry_opt.as_mut() {
+            entry.pronunciations = pronunciations_temp.into_iter().collect();
+            // Fetch senses using the already optimized internal function
+            entry.senses = self.fetch_senses_for_entry_internal(conn, entry_id)?;
+        }
 
         Ok(entry_opt)
     }
 
-    /// Internal helper to fetch pronunciations for a given entry ID.
-    fn fetch_pronunciations_for_entry(&self, conn: &Connection, entry_id: &str) -> Result<Vec<Pronunciation>> {
-        let mut stmt = conn.prepare(
-            "SELECT variety, notation, phonemic, audio, text FROM pronunciations WHERE entry_id = ?1",
-        )?;
-        let pron_iter = stmt.query_map(params![entry_id], |row| {
-            Ok(Pronunciation {
-                variety: row.get(0)?,
-                notation: row.get(1)?,
-                phonemic: row.get::<_, i64>(2)? != 0, // Convert integer back to bool
-                audio: row.get(3)?,
-                text: row.get(4)?,
-            })
-        })?;
-
-        pron_iter.collect::<std::result::Result<Vec<_>, _>>().map_err(OewnError::from)
-    }
-
-    /// Internal helper to fetch senses and their relations for a given entry ID.
+    /// Internal helper to fetch senses and their relations for a given entry ID using a JOIN.
     fn fetch_senses_for_entry_internal(&self, conn: &Connection, entry_id: &str) -> Result<Vec<Sense>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, synset_id, subcat FROM senses WHERE entry_id = ?1",
-        )?;
-        let sense_iter = stmt.query_map(params![entry_id], |row| {
+        let sql = "
+            SELECT
+                s.id, s.synset_id, s.subcat,
+                sr.target_sense_id, sr.rel_type
+            FROM senses s
+            LEFT JOIN sense_relations sr ON s.id = sr.source_sense_id
+            WHERE s.entry_id = ?1
+            ORDER BY s.id -- Important for grouping results by sense
+        ";
+        let mut stmt = conn.prepare(sql)?;
+
+        // Use a HashMap to group relations by sense ID during iteration
+        let mut senses_map: std::collections::HashMap<String, Sense> = std::collections::HashMap::new();
+
+        let rows_iter = stmt.query_map(params![entry_id], |row| {
+            // Extract data from the row
             let sense_id: String = row.get(0)?;
-            let relations = self.fetch_sense_relations(conn, &sense_id)
-                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?; // Use Text type
-            Ok(Sense {
+            let synset_id: String = row.get(1)?;
+            let subcat: Option<String> = row.get(2)?;
+            let target_sense_id: Option<String> = row.get(3)?;
+            let rel_type_str: Option<String> = row.get(4)?;
+
+            // Create or get the Sense struct from the map
+            let sense_entry = senses_map.entry(sense_id.clone()).or_insert_with(|| Sense {
                 id: sense_id.clone(),
-                synset: row.get(1)?,
-                subcat: row.get(2)?,
-                sense_relations: relations,
-            })
+                synset: synset_id,
+                subcat: subcat,
+                sense_relations: Vec::new(), // Initialize relations vector
+            });
+
+            // If relation data exists (due to LEFT JOIN), parse and add it
+            if let (Some(target), Some(rel_str)) = (target_sense_id, rel_type_str) {
+                let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                sense_entry.sense_relations.push(SenseRelation { target, rel_type });
+            }
+
+            Ok(()) // query_map expects a Result, Ok(()) indicates success for this row processing
         })?;
 
-        sense_iter.collect::<std::result::Result<Vec<_>, _>>().map_err(OewnError::from)
-    }
+        // Consume the iterator to process all rows and populate the map
+        // Explicitly handle potential errors during iteration
+        for result in rows_iter {
+            result?; // Propagate any error from query_map closure or DB interaction
+        }
 
-     /// Internal helper to fetch sense relations for a given sense ID.
-    fn fetch_sense_relations(&self, conn: &Connection, sense_id: &str) -> Result<Vec<SenseRelation>> {
-        let mut stmt = conn.prepare(
-            "SELECT target_sense_id, rel_type FROM sense_relations WHERE source_sense_id = ?1",
-        )?;
-        let rel_iter = stmt.query_map(params![sense_id], |row| {
-            let rel_type_str: String = row.get(1)?;
-            let rel_type = string_to_sense_rel_type(&rel_type_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
-            })?;
-            Ok(SenseRelation {
-                target: row.get(0)?,
-                rel_type,
-            })
-        })?;
 
-        rel_iter.collect::<std::result::Result<Vec<_>, _>>().map_err(OewnError::from)
+        // Convert the map values (Senses) into a Vec
+        Ok(senses_map.into_values().collect())
     }
 
 
-    /// Retrieves related Senses for a given source Sense ID and relation type.
+    /// Retrieves related Senses (including their relations) for a given source Sense ID and relation type using JOINs.
     /// Returns owned Sense structs fetched from the DB.
     pub fn get_related_senses(
         &self,
@@ -493,48 +774,121 @@ impl WordNet {
         let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
 
-        let rel_type_str = db::sense_rel_type_to_string(rel_type); // Convert enum to string for query
+        let rel_type_str = db::sense_rel_type_to_string(rel_type);
 
-        let mut stmt = conn.prepare(
-            "SELECT target_sense_id FROM sense_relations WHERE source_sense_id = ?1 AND rel_type = ?2",
-        )?;
-        let target_ids_iter = stmt.query_map(params![sense_id, rel_type_str], |row| row.get::<_, String>(0))?;
+        // Query joins sense_relations (sr1) to find targets, then joins senses (s_target) for target sense details,
+        // then LEFT JOINs sense_relations (sr_target) again to get relations *of the target sense*.
+        let sql = "
+            SELECT
+                s_target.id, s_target.synset_id, s_target.subcat,
+                sr_target.target_sense_id AS target_rel_target_id,
+                sr_target.rel_type AS target_rel_type
+            FROM sense_relations sr1
+            JOIN senses s_target ON sr1.target_sense_id = s_target.id
+            LEFT JOIN sense_relations sr_target ON s_target.id = sr_target.source_sense_id
+            WHERE sr1.source_sense_id = ?1 AND sr1.rel_type = ?2
+            ORDER BY s_target.id -- Important for grouping
+        ";
+        let mut stmt = conn.prepare(sql)?;
 
-        let mut senses = Vec::new();
-        for target_id_result in target_ids_iter {
-            let target_id = target_id_result?;
-            match self.fetch_full_sense_by_id(conn, &target_id)? { // Use a new helper
-                Some(sense) => senses.push(sense),
-                None => warn!("Target sense ID {} not found for relation.", target_id),
+        let mut senses_map: std::collections::HashMap<String, Sense> = std::collections::HashMap::new();
+
+        let rows_iter = stmt.query_map(params![sense_id, rel_type_str], |row| {
+            // Extract target sense data
+            let target_sense_id: String = row.get(0)?;
+            let target_synset_id: String = row.get(1)?;
+            let target_subcat: Option<String> = row.get(2)?;
+            let target_rel_target_id: Option<String> = row.get(3)?;
+            let target_rel_type_str: Option<String> = row.get(4)?;
+
+            // Create or get the target Sense struct
+            let sense_entry = senses_map.entry(target_sense_id.clone()).or_insert_with(|| Sense {
+                id: target_sense_id.clone(),
+                synset: target_synset_id,
+                subcat: target_subcat,
+                sense_relations: Vec::new(),
+            });
+
+            // If relation data *for the target sense* exists, parse and add it
+            if let (Some(target_rel_target), Some(target_rel_str)) = (target_rel_target_id, target_rel_type_str) {
+                let rel_type = string_to_sense_rel_type(&target_rel_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                 let new_relation = SenseRelation { target: target_rel_target, rel_type };
+                 if !sense_entry.sense_relations.contains(&new_relation) { // Avoid duplicates
+                     sense_entry.sense_relations.push(new_relation);
+                 }
             }
+            Ok(())
+        })?;
+
+        // Consume iterator
+        for result in rows_iter {
+            result?;
         }
-        Ok(senses)
+
+        Ok(senses_map.into_values().collect())
     }
 
-     /// Internal helper to fetch full Sense data including relations.
+     /// Internal helper to fetch full Sense data including relations using a JOIN.
     fn fetch_full_sense_by_id(&self, conn: &Connection, sense_id: &str) -> Result<Option<Sense>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, entry_id, synset_id, subcat FROM senses WHERE id = ?1",
-        )?;
-        let sense_opt = stmt.query_row(params![sense_id], |row| {
-            let sense_id_str : String = row.get(0)?;
-             let relations = self.fetch_sense_relations(conn, &sense_id_str)
-                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?; // Use Text type
-            Ok(Sense {
-                id: sense_id_str,
-                synset: row.get(2)?, // Get synset ID
-                subcat: row.get(3)?,
-                sense_relations: relations, // Fetch relations
-                // Note: We don't store entry_id directly in the Sense struct model,
-                // but it's available in the row if needed: row.get(1)?
-            })
-        }).optional()?;
+        let sql = "
+            SELECT
+                s.id, s.synset_id, s.subcat,
+                sr.target_sense_id, sr.rel_type
+            FROM senses s
+            LEFT JOIN sense_relations sr ON s.id = sr.source_sense_id
+            WHERE s.id = ?1
+        ";
+        let mut stmt = conn.prepare(sql)?;
+
+        let mut sense_opt: Option<Sense> = None;
+        let mut relations_temp: Vec<SenseRelation> = Vec::new();
+
+        let rows_iter = stmt.query_map(params![sense_id], |row| {
+            // Extract data from the row
+            let current_sense_id: String = row.get(0)?; // Should always be the same as input sense_id
+            let synset_id: String = row.get(1)?;
+            let subcat: Option<String> = row.get(2)?;
+            let target_sense_id: Option<String> = row.get(3)?;
+            let rel_type_str: Option<String> = row.get(4)?;
+
+            // Initialize the Sense struct on the first row
+            if sense_opt.is_none() {
+                sense_opt = Some(Sense {
+                    id: current_sense_id.clone(),
+                    synset: synset_id,
+                    subcat: subcat,
+                    sense_relations: Vec::new(), // Initialize relations vector
+                });
+            }
+
+            // If relation data exists (due to LEFT JOIN), parse and add it to temp vec
+            if let (Some(target), Some(rel_str)) = (target_sense_id, rel_type_str) {
+                let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                relations_temp.push(SenseRelation { target, rel_type });
+            }
+
+            Ok(()) // query_map expects a Result, Ok(()) indicates success for this row processing
+        })?;
+
+        // Consume the iterator to process all rows
+        for result in rows_iter {
+            result?; // Propagate any error
+        }
+
+        // If a sense was found, assign the collected relations
+        if let Some(sense) = sense_opt.as_mut() {
+            sense.sense_relations = relations_temp;
+        }
 
         Ok(sense_opt)
     }
 
 
-    /// Retrieves related Synsets for a given source Synset ID and relation type.
+    /// Retrieves related Synsets (including their definitions, examples, relations) for a given source Synset ID and relation type using JOINs.
     /// Returns owned Synset structs fetched from the DB.
     pub fn get_related_synsets(
         &self,
@@ -544,121 +898,217 @@ impl WordNet {
         let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
 
-        let rel_type_str = db::synset_rel_type_to_string(rel_type); // Convert enum to string
+        let rel_type_str = db::synset_rel_type_to_string(rel_type);
 
-        let mut stmt = conn.prepare(
-            "SELECT target_synset_id FROM synset_relations WHERE source_synset_id = ?1 AND rel_type = ?2",
-        )?;
-        let target_ids_iter = stmt.query_map(params![synset_id, rel_type_str], |row| row.get::<_, String>(0))?;
+        // This complex query finds target synsets via sr1, joins to get target synset details (s_target),
+        // and then LEFT JOINs definitions, ili_defs, examples, and relations *of the target synset*.
+        let sql = "
+            SELECT
+                s_target.id, s_target.ili, s_target.part_of_speech,
+                d.text AS def_text, d.dc_source AS def_source,
+                id.text AS ili_def_text, id.dc_source AS ili_def_source,
+                e.text AS ex_text, e.dc_source AS ex_source,
+                sr_target.target_synset_id AS target_rel_target_id,
+                sr_target.rel_type AS target_rel_type
+            FROM synset_relations sr1
+            JOIN synsets s_target ON sr1.target_synset_id = s_target.id
+            LEFT JOIN definitions d ON s_target.id = d.synset_id
+            LEFT JOIN ili_definitions id ON s_target.id = id.synset_id
+            LEFT JOIN examples e ON s_target.id = e.synset_id
+            LEFT JOIN synset_relations sr_target ON s_target.id = sr_target.source_synset_id
+            WHERE sr1.source_synset_id = ?1 AND sr1.rel_type = ?2
+            ORDER BY s_target.id -- Important for grouping
+        ";
+        let mut stmt = conn.prepare(sql)?;
 
-        let mut synsets = Vec::new();
-        for target_id_result in target_ids_iter {
-            let target_id = target_id_result?;
-            // Call the internal helper directly with the existing connection lock
-            match self.fetch_full_synset_by_id(conn, &target_id)? {
-                Some(synset) => synsets.push(synset), // fetch_full_synset_by_id returns Option<Synset>
-                None => warn!("Target synset ID {} not found for relation.", target_id),
-                // Errors from fetch_full_synset_by_id are propagated by ?
+        let mut synsets_map: std::collections::HashMap<String, Synset> = std::collections::HashMap::new();
+        // Temporary storage for multi-valued fields within the map processing closure
+        let mut temp_defs: std::collections::HashMap<String, std::collections::HashSet<Definition>> = std::collections::HashMap::new();
+        let mut temp_examples: std::collections::HashMap<String, std::collections::HashSet<Example>> = std::collections::HashMap::new();
+        let mut temp_relations: std::collections::HashMap<String, std::collections::HashSet<SynsetRelation>> = std::collections::HashMap::new();
+
+        let rows_iter = stmt.query_map(params![synset_id, rel_type_str], |row| {
+            // Extract target synset core data
+            let target_id: String = row.get(0)?;
+            let target_ili: Option<String> = row.get(1)?;
+            let target_pos_str: String = row.get(2)?;
+            let target_part_of_speech = string_to_part_of_speech(&target_pos_str)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+
+            // Create or get the target Synset struct (without multi-valued fields initially)
+            let synset_entry = synsets_map.entry(target_id.clone()).or_insert_with(|| Synset {
+                id: target_id.clone(),
+                ili: target_ili,
+                part_of_speech: target_part_of_speech,
+                definitions: Vec::new(),
+                ili_definition: None, // Will be set below if found
+                examples: Vec::new(),
+                synset_relations: Vec::new(),
+                members: String::new(),
+            });
+
+            // Extract ILI definition (only needs to be done once per synset)
+            if synset_entry.ili_definition.is_none() {
+                let ili_text: Option<String> = row.get(5)?;
+                let ili_source: Option<String> = row.get(6)?;
+                if let Some(text) = ili_text {
+                    synset_entry.ili_definition = Some(ILIDefinition { text, dc_source: ili_source });
+                }
+            }
+
+            // Extract and store definitions in temporary HashSet for the current target_id
+            let def_text: Option<String> = row.get(3)?;
+            let def_source: Option<String> = row.get(4)?;
+            if let Some(text) = def_text {
+                 temp_defs.entry(target_id.clone())
+                     .or_default()
+                     .insert(Definition { text, dc_source: def_source });
+            }
+
+            // Extract and store examples
+            let ex_text: Option<String> = row.get(7)?;
+            let ex_source: Option<String> = row.get(8)?;
+            if let Some(text) = ex_text {
+                 temp_examples.entry(target_id.clone())
+                     .or_default()
+                     .insert(Example { text, dc_source: ex_source });
+            }
+
+            // Extract and store relations
+            let target_rel_target_id: Option<String> = row.get(9)?;
+            let target_rel_type_str: Option<String> = row.get(10)?;
+            if let (Some(target), Some(rel_str)) = (target_rel_target_id, target_rel_type_str) {
+                let rel_type = string_to_synset_rel_type(&rel_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                 temp_relations.entry(target_id.clone())
+                     .or_default()
+                     .insert(SynsetRelation { target, rel_type });
+            }
+
+            Ok(())
+        })?;
+
+        // Consume iterator to process all rows
+        for result in rows_iter {
+            result?;
+        }
+
+        // Populate the multi-valued fields from the temporary HashSets
+        for (id, synset) in synsets_map.iter_mut() {
+            if let Some(defs) = temp_defs.remove(id) {
+                synset.definitions = defs.into_iter().collect();
+            }
+            if let Some(exs) = temp_examples.remove(id) {
+                synset.examples = exs.into_iter().collect();
+            }
+            if let Some(rels) = temp_relations.remove(id) {
+                synset.synset_relations = rels.into_iter().collect();
             }
         }
-        Ok(synsets)
+
+        Ok(synsets_map.into_values().collect())
     }
 
     // --- Internal Helper Methods ---
 
-    /// Internal helper to fetch full Synset data including relations, definitions, examples.
+    /// Internal helper to fetch full Synset data including relations, definitions, examples using JOINs.
     fn fetch_full_synset_by_id(&self, conn: &Connection, synset_id: &str) -> Result<Option<Synset>> {
-         let mut stmt = conn.prepare(
-            "SELECT id, ili, part_of_speech FROM synsets WHERE id = ?1",
-        )?;
-        let synset_opt = stmt.query_row(params![synset_id], |row| {
-            let id: String = row.get(0)?;
-            let pos_str: String = row.get(2)?;
-            // Explicitly map OewnError from helpers to rusqlite::Error within the closure
-            let part_of_speech = string_to_part_of_speech(&pos_str)
-                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
-            let definitions = self.fetch_definitions_for_synset(conn, &id)
-                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?; // Use Text type
-            let ili_definition = self.fetch_ili_definition_for_synset(conn, &id)
-                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?; // Use Text type
-            let examples = self.fetch_examples_for_synset(conn, &id)
-                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?; // Use Text type
-            let synset_relations = self.fetch_synset_relations(conn, &id)
-                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?; // Use Text type
+        // This query joins synsets with definitions, ili_definitions, examples, and synset_relations.
+        // LEFT JOINs are used to ensure the synset is returned even if it has no definitions, examples, etc.
+        let sql = "
+            SELECT
+                s.id, s.ili, s.part_of_speech,
+                d.text AS def_text, d.dc_source AS def_source,
+                id.text AS ili_def_text, id.dc_source AS ili_def_source,
+                e.text AS ex_text, e.dc_source AS ex_source,
+                sr.target_synset_id, sr.rel_type
+            FROM synsets s
+            LEFT JOIN definitions d ON s.id = d.synset_id
+            LEFT JOIN ili_definitions id ON s.id = id.synset_id
+            LEFT JOIN examples e ON s.id = e.synset_id
+            LEFT JOIN synset_relations sr ON s.id = sr.source_synset_id
+            WHERE s.id = ?1
+        ";
+        let mut stmt = conn.prepare(sql)?;
 
-            Ok(Synset {
-                id: id.clone(),
-                ili: row.get(1)?,
-                part_of_speech,
-                definitions,
-                ili_definition,
-                examples,
-                synset_relations,
-                members: String::new(), // 'members' attribute from XML is not directly stored; derived from senses
-            })
-        }).optional()?;
+        let mut synset_opt: Option<Synset> = None;
+        // Use HashSets to avoid duplicates when multiple relations/defs/examples exist
+        let mut definitions_temp: std::collections::HashSet<Definition> = std::collections::HashSet::new();
+        let mut examples_temp: std::collections::HashSet<Example> = std::collections::HashSet::new();
+        let mut relations_temp: std::collections::HashSet<SynsetRelation> = std::collections::HashSet::new();
+        let mut ili_definition_temp: Option<ILIDefinition> = None;
+
+        let rows_iter = stmt.query_map(params![synset_id], |row| {
+            // Extract core synset data (only needed once)
+            if synset_opt.is_none() {
+                let id: String = row.get(0)?;
+                let ili: Option<String> = row.get(1)?;
+                let pos_str: String = row.get(2)?;
+                let part_of_speech = string_to_part_of_speech(&pos_str)
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+
+                synset_opt = Some(Synset {
+                    id: id.clone(),
+                    ili,
+                    part_of_speech,
+                    definitions: Vec::new(), // Initialize vectors
+                    ili_definition: None,
+                    examples: Vec::new(),
+                    synset_relations: Vec::new(),
+                    members: String::new(), // Not fetched directly
+                });
+
+                // Extract ILI definition (should only be one row or none)
+                let ili_text: Option<String> = row.get(5)?;
+                let ili_source: Option<String> = row.get(6)?;
+                if let Some(text) = ili_text {
+                    ili_definition_temp = Some(ILIDefinition { text, dc_source: ili_source });
+                }
+            }
+
+            // Extract definition data (if present in this row)
+            let def_text: Option<String> = row.get(3)?;
+            let def_source: Option<String> = row.get(4)?;
+            if let Some(text) = def_text {
+                definitions_temp.insert(Definition { text, dc_source: def_source });
+            }
+
+            // Extract example data (if present)
+            let ex_text: Option<String> = row.get(7)?;
+            let ex_source: Option<String> = row.get(8)?;
+            if let Some(text) = ex_text {
+                examples_temp.insert(Example { text, dc_source: ex_source });
+            }
+
+            // Extract relation data (if present)
+            let target_synset_id: Option<String> = row.get(9)?;
+            let rel_type_str: Option<String> = row.get(10)?;
+            if let (Some(target), Some(rel_str)) = (target_synset_id, rel_type_str) {
+                let rel_type = string_to_synset_rel_type(&rel_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                relations_temp.insert(SynsetRelation { target, rel_type });
+            }
+
+            Ok(())
+        })?;
+
+        // Consume iterator
+        for result in rows_iter {
+            result?;
+        }
+
+        // Assign collected data to the synset if it was found
+        if let Some(synset) = synset_opt.as_mut() {
+            synset.definitions = definitions_temp.into_iter().collect();
+            synset.ili_definition = ili_definition_temp;
+            synset.examples = examples_temp.into_iter().collect();
+            synset.synset_relations = relations_temp.into_iter().collect();
+        }
+
         Ok(synset_opt)
     }
-
-     /// Internal helper to fetch definitions for a given synset ID.
-    fn fetch_definitions_for_synset(&self, conn: &Connection, synset_id: &str) -> Result<Vec<Definition>> {
-        let mut stmt = conn.prepare(
-            "SELECT text, dc_source FROM definitions WHERE synset_id = ?1",
-        )?;
-        let def_iter = stmt.query_map(params![synset_id], |row| {
-            Ok(Definition {
-                text: row.get(0)?,
-                dc_source: row.get(1)?,
-            })
-        })?;
-        def_iter.collect::<std::result::Result<Vec<_>, _>>().map_err(OewnError::from)
-    }
-
-     /// Internal helper to fetch the ILI definition for a given synset ID.
-    fn fetch_ili_definition_for_synset(&self, conn: &Connection, synset_id: &str) -> Result<Option<ILIDefinition>> {
-        let mut stmt = conn.prepare(
-            "SELECT text, dc_source FROM ili_definitions WHERE synset_id = ?1",
-        )?;
-        stmt.query_row(params![synset_id], |row| {
-            Ok(ILIDefinition {
-                text: row.get(0)?,
-                dc_source: row.get(1)?,
-            })
-        }).optional().map_err(OewnError::from)
-    }
-
-     /// Internal helper to fetch examples for a given synset ID.
-    fn fetch_examples_for_synset(&self, conn: &Connection, synset_id: &str) -> Result<Vec<Example>> {
-        let mut stmt = conn.prepare(
-            "SELECT text, dc_source FROM examples WHERE synset_id = ?1",
-        )?;
-        let ex_iter = stmt.query_map(params![synset_id], |row| {
-            Ok(Example {
-                text: row.get(0)?,
-                dc_source: row.get(1)?,
-            })
-        })?;
-        ex_iter.collect::<std::result::Result<Vec<_>, _>>().map_err(OewnError::from)
-    }
-
-     /// Internal helper to fetch synset relations for a given synset ID.
-    fn fetch_synset_relations(&self, conn: &Connection, synset_id: &str) -> Result<Vec<SynsetRelation>> {
-        let mut stmt = conn.prepare(
-            "SELECT target_synset_id, rel_type FROM synset_relations WHERE source_synset_id = ?1",
-        )?;
-        let rel_iter = stmt.query_map(params![synset_id], |row| {
-            let rel_type_str: String = row.get(1)?;
-            let rel_type = string_to_synset_rel_type(&rel_type_str).map_err(|e| {
-                 rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
-            })?;
-            Ok(SynsetRelation {
-                target: row.get(0)?,
-                rel_type,
-            })
-        })?;
-        rel_iter.collect::<std::result::Result<Vec<_>, _>>().map_err(OewnError::from)
-    }
-
 }
 
 // --- Mapping Helpers (Row -> Struct) ---

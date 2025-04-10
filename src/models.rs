@@ -96,7 +96,7 @@ pub enum PartOfSpeech {
     U, // Unknown
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Pronunciation {
     #[serde(rename = "@variety")]
     pub variety: String, // e.g., "en-GB-fonipa"
@@ -182,7 +182,7 @@ pub struct Synset {
     pub examples: Vec<Example>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Definition {
     #[serde(rename = "@dc:source", default)]
     pub dc_source: Option<String>,
@@ -198,7 +198,7 @@ pub struct ILIDefinition {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SynsetRelation {
     #[serde(rename = "@relType")]
     pub rel_type: SynsetRelType,
@@ -313,7 +313,7 @@ pub enum SynsetRelType {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Example {
     #[serde(rename = "@dc:source", default)]
     pub dc_source: Option<String>,

@@ -226,188 +226,186 @@ pub fn initialize_database(conn: &mut Connection) -> Result<()> {
 
 /// Populates the database tables from a parsed LexicalResource.
 /// Assumes the database is empty or should be overwritten.
-/// Uses a transaction for efficiency.
+/// Uses a transaction and prepared statements for efficiency.
 pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Result<()> {
-    info!("Populating database from parsed LexicalResource...");
+    info!("Populating database from parsed LexicalResource using prepared statements...");
     let start_time = Instant::now();
-
-    // Clear existing data (optional, depends on strategy)
-    // clear_database_data(conn)?; // Call a helper to DELETE FROM all tables if needed
 
     let tx = conn.transaction()?;
 
+    // --- Prepare Statements ---
+    let mut lexicon_stmt = tx.prepare(
+        "INSERT INTO lexicons (id, label, language, email, license, version, url, citation, logo, status, confidence_score, dc_publisher, dc_contributor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+    )?;
+    let mut entry_stmt = tx.prepare(
+        "INSERT INTO lexical_entries (id, lexicon_id, lemma_written_form, lemma_written_form_lower, part_of_speech)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut synset_stmt = tx.prepare(
+        "INSERT INTO synsets (id, lexicon_id, ili, part_of_speech)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    let mut pron_stmt = tx.prepare(
+        "INSERT INTO pronunciations (entry_id, variety, notation, phonemic, audio, text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut sense_stmt = tx.prepare(
+        "INSERT INTO senses (id, entry_id, synset_id, subcat)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    let mut def_stmt = tx.prepare(
+        "INSERT INTO definitions (synset_id, text, dc_source)
+         VALUES (?1, ?2, ?3)",
+    )?;
+    let mut ili_def_stmt = tx.prepare(
+        "INSERT INTO ili_definitions (synset_id, text, dc_source)
+         VALUES (?1, ?2, ?3)",
+    )?;
+    let mut example_stmt = tx.prepare(
+        "INSERT INTO examples (synset_id, text, dc_source)
+         VALUES (?1, ?2, ?3)",
+    )?;
+    let mut sense_rel_stmt = tx.prepare(
+        "INSERT OR IGNORE INTO sense_relations (source_sense_id, target_sense_id, rel_type)
+         VALUES (?1, ?2, ?3)",
+    )?;
+    let mut synset_rel_stmt = tx.prepare(
+        "INSERT OR IGNORE INTO synset_relations (source_synset_id, target_synset_id, rel_type)
+         VALUES (?1, ?2, ?3)",
+    )?;
+
     // --- Pass 1: Insert core entities (Lexicons, Entries, Synsets) ---
     info!("Population Pass 1: Inserting Lexicons, LexicalEntries, Synsets...");
-    for lexicon in &resource.lexicons { // Iterate by reference first
+    for lexicon in &resource.lexicons {
         debug!("Pass 1: Inserting lexicon: {}", lexicon.id);
-        tx.execute(
-            "INSERT INTO lexicons (id, label, language, email, license, version, url, citation, logo, status, confidence_score, dc_publisher, dc_contributor)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                lexicon.id,
-                lexicon.label,
-                lexicon.language,
-                lexicon.email,
-                lexicon.license,
-                lexicon.version,
-                lexicon.url,
-                lexicon.citation,
-                lexicon.logo,
-                lexicon.status,
-                lexicon.confidence_score,
-                lexicon.dc_publisher,
-                lexicon.dc_contributor,
-            ],
-        )?;
+        lexicon_stmt.execute(params![
+            lexicon.id,
+            lexicon.label,
+            lexicon.language,
+            lexicon.email,
+            lexicon.license,
+            lexicon.version,
+            lexicon.url,
+            lexicon.citation,
+            lexicon.logo,
+            lexicon.status,
+            lexicon.confidence_score,
+            lexicon.dc_publisher,
+            lexicon.dc_contributor,
+        ])?;
 
-        for entry in &lexicon.lexical_entries { // Iterate by reference
-            tx.execute(
-                "INSERT INTO lexical_entries (id, lexicon_id, lemma_written_form, lemma_written_form_lower, part_of_speech)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    entry.id,
-                    lexicon.id, // Foreign key
-                    entry.lemma.written_form,
-                    entry.lemma.written_form.to_lowercase(), // Store lowercase version
-                    part_of_speech_to_string(entry.lemma.part_of_speech), // Store POS as string
-                ],
-            )?;
-            // Defer pronunciation insertion to Pass 2
+        for entry in &lexicon.lexical_entries {
+            entry_stmt.execute(params![
+                entry.id,
+                lexicon.id, // Foreign key
+                entry.lemma.written_form,
+                entry.lemma.written_form.to_lowercase(), // Store lowercase version
+                part_of_speech_to_string(entry.lemma.part_of_speech), // Store POS as string
+            ])?;
         }
 
-        for synset in &lexicon.synsets { // Iterate by reference
-            tx.execute(
-                "INSERT INTO synsets (id, lexicon_id, ili, part_of_speech)
-                 VALUES (?1, ?2, ?3, ?4)",
-                // Correct params! macro for synsets table
-                params![
-                    synset.id,
-                    lexicon.id, // Foreign key
-                    synset.ili,
-                    part_of_speech_to_string(synset.part_of_speech), // Store POS as string
-                ],
-            )?;
-            // Defer definition, ili_definition, example, synset_relation insertion to later passes
+        for synset in &lexicon.synsets {
+            synset_stmt.execute(params![
+                synset.id,
+                lexicon.id, // Foreign key
+                synset.ili,
+                part_of_speech_to_string(synset.part_of_speech), // Store POS as string
+            ])?;
         }
     }
     info!("Pass 1 complete.");
 
     // --- Pass 2: Insert entities referencing core entities (Senses, Definitions, Examples, Pronunciations) ---
     info!("Population Pass 2: Inserting Senses, Definitions, Examples, Pronunciations...");
-    for lexicon in &resource.lexicons { // Iterate again
+    for lexicon in &resource.lexicons {
         for entry in &lexicon.lexical_entries {
-             // Insert Pronunciations
-             for pron in &entry.pronunciations {
-                 tx.execute(
-                     "INSERT INTO pronunciations (entry_id, variety, notation, phonemic, audio, text)
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                     params![
-                         entry.id, // Foreign key
-                         pron.variety,
-                         pron.notation,
-                         pron.phonemic, // Store bool as integer
-                         pron.audio,
-                         pron.text,
-                     ],
-                 )?;
-             }
-
-            // Insert Senses
-            for sense in &entry.senses {
-                tx.execute(
-                    "INSERT INTO senses (id, entry_id, synset_id, subcat)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        sense.id,
-                        entry.id, // Foreign key
-                        sense.synset, // Foreign key (references synset.id)
-                        sense.subcat,
-                    ],
-                )?;
-                 // Defer sense_relation insertion to Pass 3
+            for pron in &entry.pronunciations {
+                pron_stmt.execute(params![
+                    entry.id, // Foreign key
+                    pron.variety,
+                    pron.notation,
+                    pron.phonemic, // Store bool as integer
+                    pron.audio,
+                    pron.text,
+                ])?;
             }
-             // Insert Syntactic Behaviours if needed (would likely be in this pass too)
+
+            for sense in &entry.senses {
+                sense_stmt.execute(params![
+                    sense.id,
+                    entry.id, // Foreign key
+                    sense.synset, // Foreign key (references synset.id)
+                    sense.subcat,
+                ])?;
+            }
         }
 
         for synset in &lexicon.synsets {
-             // Insert Definitions
-             for definition in &synset.definitions {
-                 tx.execute(
-                     "INSERT INTO definitions (synset_id, text, dc_source)
-                      VALUES (?1, ?2, ?3)",
-                     params![
-                         synset.id, // Foreign key
-                         definition.text,
-                         definition.dc_source,
-                     ],
-                 )?;
-             }
+            for definition in &synset.definitions {
+                def_stmt.execute(params![
+                    synset.id, // Foreign key
+                    definition.text,
+                    definition.dc_source,
+                ])?;
+            }
 
-            // Insert ILI Definition
             if let Some(ili_def) = &synset.ili_definition {
-                tx.execute(
-                    "INSERT INTO ili_definitions (synset_id, text, dc_source)
-                     VALUES (?1, ?2, ?3)",
-                     params![
-                         synset.id, // Primary key
-                         ili_def.text,
-                         ili_def.dc_source,
-                     ],
-                 )?;
-             }
+                ili_def_stmt.execute(params![
+                    synset.id, // Primary key
+                    ili_def.text,
+                    ili_def.dc_source,
+                ])?;
+            }
 
-            // Insert Examples
             for example in &synset.examples {
-                tx.execute(
-                    "INSERT INTO examples (synset_id, text, dc_source)
-                     VALUES (?1, ?2, ?3)",
-                     params![
-                         synset.id, // Foreign key
-                         example.text,
-                         example.dc_source,
-                     ],
-                 )?;
-             }
-             // Defer synset_relation insertion to Pass 3
+                example_stmt.execute(params![
+                    synset.id, // Foreign key
+                    example.text,
+                    example.dc_source,
+                ])?;
+            }
         }
     }
-     info!("Pass 2 complete.");
+    info!("Pass 2 complete.");
 
-     // --- Pass 3: Insert relations (SenseRelations, SynsetRelations) ---
-     info!("Population Pass 3: Inserting SenseRelations, SynsetRelations...");
-     for lexicon in &resource.lexicons { // Iterate again
-         for entry in &lexicon.lexical_entries {
-             for sense in &entry.senses {
-                 // Insert Sense Relations (using INSERT OR IGNORE to handle potential duplicates in source data)
-                 for relation in &sense.sense_relations {
-                     tx.execute(
-                         "INSERT OR IGNORE INTO sense_relations (source_sense_id, target_sense_id, rel_type)
-                          VALUES (?1, ?2, ?3)",
-                         params![
-                             sense.id, // Source sense
-                             relation.target, // Target sense ID
-                             sense_rel_type_to_string(relation.rel_type), // Store type as string
-                         ],
-                     )?;
-                 }
-             }
-         }
-         for synset in &lexicon.synsets {
-             // Insert Synset Relations (using INSERT OR IGNORE)
-             for relation in &synset.synset_relations {
-                 tx.execute(
-                     "INSERT OR IGNORE INTO synset_relations (source_synset_id, target_synset_id, rel_type)
-                      VALUES (?1, ?2, ?3)",
-                     params![
-                         synset.id, // Source synset
-                         relation.target, // Target synset ID
-                         synset_rel_type_to_string(relation.rel_type), // Store type as string
-                     ],
-                 )?;
-             }
-         }
-     }
-     info!("Pass 3 complete.");
+    // --- Pass 3: Insert relations (SenseRelations, SynsetRelations) ---
+    info!("Population Pass 3: Inserting SenseRelations, SynsetRelations...");
+    for lexicon in &resource.lexicons {
+        for entry in &lexicon.lexical_entries {
+            for sense in &entry.senses {
+                for relation in &sense.sense_relations {
+                    sense_rel_stmt.execute(params![
+                        sense.id, // Source sense
+                        relation.target, // Target sense ID
+                        sense_rel_type_to_string(relation.rel_type), // Store type as string
+                    ])?;
+                }
+            }
+        }
+        for synset in &lexicon.synsets {
+            for relation in &synset.synset_relations {
+                synset_rel_stmt.execute(params![
+                    synset.id, // Source synset
+                    relation.target, // Target synset ID
+                    synset_rel_type_to_string(relation.rel_type), // Store type as string
+                ])?;
+            }
+        }
+    }
+    info!("Pass 3 complete.");
+
+    // Drop statements explicitly before committing (optional, but good practice)
+    drop(lexicon_stmt);
+    drop(entry_stmt);
+    drop(synset_stmt);
+    drop(pron_stmt);
+    drop(sense_stmt);
+    drop(def_stmt);
+    drop(ili_def_stmt);
+    drop(example_stmt);
+    drop(sense_rel_stmt);
+    drop(synset_rel_stmt);
 
     tx.commit()?; // Commit the transaction
 
