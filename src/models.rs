@@ -321,7 +321,6 @@ pub struct Example {
     pub text: String,
 }
 
-
 // Helper function for parsing space-separated member lists
 pub fn parse_members(members_str: &str) -> Vec<String> {
     members_str.split_whitespace().map(String::from).collect()

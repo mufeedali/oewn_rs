@@ -2,13 +2,7 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use log::{LevelFilter, debug, error, info, warn};
 use oewn_rs::{
-    LexicalEntry,
-    LoadOptions,
-    SenseRelType,
-    Synset,
-    SynsetRelType,
-    WordNet,
-    error::Result,
+    LexicalEntry, LoadOptions, SenseRelType, Synset, SynsetRelType, WordNet, error::Result,
     models::PartOfSpeech,
 };
 use std::collections::HashMap;
@@ -164,7 +158,7 @@ async fn handle_define(wn: &WordNet, word: &str, pos_filter: Option<PartOfSpeech
         println!(
             "\n{} ~ {}",
             lemma_form.bold().cyan(),
-            pos.to_string().italic()  // Italic for POS
+            pos.to_string().italic() // Italic for POS
         );
 
         // Print pronunciations (using the first entry in the group)
@@ -220,7 +214,7 @@ fn print_sense_details(
     counter: usize,
 ) -> Result<()> {
     // 1. Print Definition(s)
-    for def in &synset.definitions { // No change needed here
+    for def in &synset.definitions {
         // Indent definition
         println!("  {}: {}", counter.to_string().bold(), def.text.trim());
     }
@@ -304,16 +298,20 @@ fn print_relation(
         RelTypeMarker::Sense(sense_rel) => {
             // Iterate through ALL senses belonging to this synset
             let member_senses = wn.get_senses_for_synset(&synset.id)?; // Returns Vec<Sense>
-            for member_sense in member_senses { // member_sense is Sense
+            for member_sense in member_senses {
+                // member_sense is Sense
                 // Get relations for *this specific member sense*
                 let related_target_senses = wn.get_related_senses(&member_sense.id, sense_rel)?; // Returns Vec<Sense>
-                for target_sense in related_target_senses { // target_sense is Sense
+                for target_sense in related_target_senses {
+                    // target_sense is Sense
                     // Important: Ensure the target sense is NOT part of the current synset
                     // (e.g., avoid listing members of the same synset as antonyms)
                     if target_sense.synset != synset.id {
                         // Find the entry for this target sense
-                        if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id)? { // Returns Result<Option<String>>
-                            if let Some(entry) = wn.get_entry_by_id(&entry_id)? { // Returns Result<Option<LexicalEntry>>
+                        if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id)? {
+                            // Returns Result<Option<String>>
+                            if let Some(entry) = wn.get_entry_by_id(&entry_id)? {
+                                // Returns Result<Option<LexicalEntry>>
                                 if !related_lemmas.contains(&entry.lemma.written_form) {
                                     related_lemmas.push(entry.lemma.written_form.clone());
                                 }
@@ -325,16 +323,20 @@ fn print_relation(
         }
         RelTypeMarker::Synset(synset_rel) => {
             let related_synsets = wn.get_related_synsets(&synset.id, synset_rel)?; // Returns Vec<Synset>
-            for target_synset in related_synsets { // target_synset is Synset
+            for target_synset in related_synsets {
+                // target_synset is Synset
                 // Get all lemmas associated with this target synset
                 let target_senses = wn.get_senses_for_synset(&target_synset.id)?; // Returns Vec<Sense>
-                for target_sense in target_senses { // target_sense is Sense
-                    if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id)? { // Returns Result<Option<String>>
+                for target_sense in target_senses {
+                    // target_sense is Sense
+                    if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id)? {
+                        // Returns Result<Option<String>>
                         // Use helper method
-                        if let Some(entry) = wn.get_entry_by_id(&entry_id)? { // Returns Result<Option<LexicalEntry>>
+                        if let Some(entry) = wn.get_entry_by_id(&entry_id)? {
+                            // Returns Result<Option<LexicalEntry>>
                             // Use helper method
                             if !related_lemmas.contains(&entry.lemma.written_form) {
-                                related_lemmas.push(entry.lemma.written_form.clone()); // No change needed
+                                related_lemmas.push(entry.lemma.written_form.clone());
                             }
                         }
                     }

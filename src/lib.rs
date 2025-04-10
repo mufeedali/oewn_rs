@@ -8,39 +8,23 @@ pub mod parse;
 // Re-export key types for easier use
 pub use error::{OewnError, Result};
 pub use models::{
-    Definition,
-    Example,
-    ILIDefinition,
-    Lemma,
-    LexicalEntry,
-    LexicalResource,
-    Lexicon,
-    PartOfSpeech,
-    Pronunciation,
-    Sense,
-    SenseRelType,
-    SenseRelation,
-    Synset,
-    SynsetRelType,
-    SynsetRelation,
-    SyntacticBehaviour,
+    Definition, Example, ILIDefinition, Lemma, LexicalEntry, LexicalResource, Lexicon,
+    PartOfSpeech, Pronunciation, Sense, SenseRelType, SenseRelation, Synset, SynsetRelType,
+    SynsetRelation, SyntacticBehaviour,
 };
 
+use crate::db::{string_to_part_of_speech, string_to_sense_rel_type, string_to_synset_rel_type};
 use directories_next::ProjectDirs;
 use log::{debug, error, info, warn};
-use crate::db::{string_to_part_of_speech, string_to_sense_rel_type, string_to_synset_rel_type};
 use parse::parse_lmf;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row}; // Import rusqlite types
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params}; // Import rusqlite types
 use std::fs;
 use std::path::{Path, PathBuf}; // Keep PathBuf
 use std::sync::{Arc, Mutex}; // Use Mutex for interior mutability of Connection
 
-
 // --- Constants ---
 
-
 // --- Processed Data Structure ---
-
 
 // --- WordNet Struct ---
 
@@ -73,7 +57,7 @@ pub struct WordNet {
 fn open_db_connection(path: &Path) -> Result<Connection> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| OewnError::Io(e))?;
+        fs::create_dir_all(parent).map_err(OewnError::Io)?;
     }
     // Open the connection with flags for read/write/create
     let conn = Connection::open_with_flags(
@@ -93,7 +77,6 @@ fn open_db_connection(path: &Path) -> Result<Connection> {
 
     Ok(conn)
 }
-
 
 impl WordNet {
     /// Loads the WordNet data using default options (automatic database path).
@@ -131,28 +114,27 @@ impl WordNet {
         // 4. Check if population is needed (beyond just file existence/force_reload)
         // We can check if a core table (e.g., lexicons) is empty.
         if !needs_population {
-            let lexicon_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM lexicons",
-                [],
-                |row| row.get(0),
-            )?;
+            let lexicon_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM lexicons", [], |row| row.get(0))?;
             if lexicon_count == 0 {
                 info!("Database exists but appears empty. Triggering population.");
                 needs_population = true;
             } else {
-                 info!("Database exists and contains data. Skipping population.");
+                info!("Database exists and contains data. Skipping population.");
             }
         }
 
         // 5. Populate database if needed
         if needs_population {
             if options.force_reload && db_exists {
-                 info!("Force reload requested. Clearing existing database data before population...");
-                 // Use a transaction to clear data efficiently
-                 let tx = conn.transaction()?;
-                 db::clear_database_data(&tx)?;
-                 tx.commit()?; // Commit the clearing transaction
-                 info!("Existing data cleared.");
+                info!(
+                    "Force reload requested. Clearing existing database data before population..."
+                );
+                // Use a transaction to clear data efficiently
+                let tx = conn.transaction()?;
+                db::clear_database_data(&tx)?;
+                tx.commit()?; // Commit the clearing transaction
+                info!("Existing data cleared.");
             } else {
                 info!("Database needs population (first run or empty).");
             }
@@ -169,7 +151,6 @@ impl WordNet {
             // Populate the database tables
             // populate_database handles its own transaction
             db::populate_database(&mut conn, resource)?;
-
         } else {
             info!("Using existing populated database: {:?}", db_path);
         }
@@ -195,7 +176,6 @@ impl WordNet {
         Ok(data_dir.join(db_filename))
     }
 
-
     /// Clears the WordNet database file(s).
     ///
     /// If `db_path_override` is `Some`, it attempts to delete that specific file.
@@ -208,7 +188,10 @@ impl WordNet {
             }
             None => {
                 let default_path = Self::get_default_db_path()?;
-                info!("Attempting to clear default database file: {:?}", default_path);
+                info!(
+                    "Attempting to clear default database file: {:?}",
+                    default_path
+                );
                 default_path
             }
         };
@@ -258,8 +241,14 @@ impl WordNet {
         lemma: &str,
         pos_filter: Option<PartOfSpeech>,
     ) -> Result<Vec<LexicalEntry>> {
-        debug!("lookup_entries (optimized): lemma='{}', pos={:?}", lemma, pos_filter);
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        debug!(
+            "lookup_entries (optimized): lemma='{}', pos={:?}",
+            lemma, pos_filter
+        );
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
 
         let pos_str_filter = pos_filter.map(db::part_of_speech_to_string);
@@ -282,30 +271,47 @@ impl WordNet {
         let mut stmt = conn.prepare(sql)?;
 
         // Use HashMaps to aggregate data during iteration
-        let mut entries_map: std::collections::HashMap<String, LexicalEntry> = std::collections::HashMap::new();
+        let mut entries_map: std::collections::HashMap<String, LexicalEntry> =
+            std::collections::HashMap::new();
         // Temporary storage for multi-valued fields, keyed by entry_id
-        let mut temp_pronunciations: std::collections::HashMap<String, std::collections::HashSet<Pronunciation>> = std::collections::HashMap::new();
+        let mut temp_pronunciations: std::collections::HashMap<
+            String,
+            std::collections::HashSet<Pronunciation>,
+        > = std::collections::HashMap::new();
         // Temporary storage for senses, keyed by entry_id, then sense_id
-        let mut temp_senses: std::collections::HashMap<String, std::collections::HashMap<String, Sense>> = std::collections::HashMap::new();
-
+        let mut temp_senses: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Sense>,
+        > = std::collections::HashMap::new();
 
         let rows_iter = stmt.query_map(params![lemma.to_lowercase(), pos_str_filter], |row| {
             // --- Extract Core Entry Data ---
             let entry_id: String = row.get("entry_id")?;
             let lemma_written_form: String = row.get("lemma_written_form")?;
             let part_of_speech_str: String = row.get("part_of_speech")?;
-            let part_of_speech = string_to_part_of_speech(&part_of_speech_str)
-                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+            let part_of_speech = string_to_part_of_speech(&part_of_speech_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
 
             // --- Create or Get Entry in Map ---
             // Prefix with _ as the variable itself isn't used directly after insertion/retrieval
-            let _entry_map_entry = entries_map.entry(entry_id.clone()).or_insert_with(|| LexicalEntry {
-                id: entry_id.clone(),
-                lemma: Lemma { written_form: lemma_written_form, part_of_speech },
-                pronunciations: Vec::new(),
-                senses: Vec::new(),
-                syntactic_behaviours: Vec::new(),
-            });
+            let _entry_map_entry =
+                entries_map
+                    .entry(entry_id.clone())
+                    .or_insert_with(|| LexicalEntry {
+                        id: entry_id.clone(),
+                        lemma: Lemma {
+                            written_form: lemma_written_form,
+                            part_of_speech,
+                        },
+                        pronunciations: Vec::new(),
+                        senses: Vec::new(),
+                        syntactic_behaviours: Vec::new(),
+                    });
 
             // --- Extract and Store Pronunciation ---
             let pron_variety: Option<String> = row.get("variety")?;
@@ -314,19 +320,23 @@ impl WordNet {
                 let pron_phonemic_int: Option<i64> = row.get("phonemic")?;
                 let pron_audio: Option<String> = row.get("audio")?;
                 let pron_text: Option<String> = row.get("pron_text")?;
-                 if let (Some(ph_int), Some(txt)) = (pron_phonemic_int, pron_text) {
-                     temp_pronunciations.entry(entry_id.clone())
-                         .or_default()
-                         .insert(Pronunciation {
-                             variety: var,
-                             notation: pron_notation,
-                             phonemic: ph_int != 0,
-                             audio: pron_audio,
-                             text: txt,
-                         });
-                 } else {
-                      warn!("Incomplete pronunciation data found during lookup for entry {}", entry_id);
-                 }
+                if let (Some(ph_int), Some(txt)) = (pron_phonemic_int, pron_text) {
+                    temp_pronunciations
+                        .entry(entry_id.clone())
+                        .or_default()
+                        .insert(Pronunciation {
+                            variety: var,
+                            notation: pron_notation,
+                            phonemic: ph_int != 0,
+                            audio: pron_audio,
+                            text: txt,
+                        });
+                } else {
+                    warn!(
+                        "Incomplete pronunciation data found during lookup for entry {}",
+                        entry_id
+                    );
+                }
             }
 
             // --- Extract and Store Sense and Sense Relation ---
@@ -338,18 +348,24 @@ impl WordNet {
                 let sense_rel_type_str: Option<String> = row.get("sense_rel_type")?;
 
                 // Get or create the sense within the entry's sense map
-                 let entry_senses = temp_senses.entry(entry_id.clone()).or_default();
-                 let sense_entry = entry_senses.entry(sense_id.clone()).or_insert_with(|| Sense {
-                     id: sense_id.clone(),
-                     synset: synset_id,
-                     subcat: subcat,
-                     sense_relations: Vec::new(),
-                 });
+                let entry_senses = temp_senses.entry(entry_id.clone()).or_default();
+                let sense_entry = entry_senses
+                    .entry(sense_id.clone())
+                    .or_insert_with(|| Sense {
+                        id: sense_id.clone(),
+                        synset: synset_id,
+                        subcat,
+                        sense_relations: Vec::new(),
+                    });
 
                 // Add relation if present
                 if let (Some(target), Some(rel_str)) = (sense_rel_target, sense_rel_type_str) {
                     let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e)) // Adjust index if needed
+                        rusqlite::Error::FromSqlConversionFailure(
+                            12,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        ) // Adjust index if needed
                     })?;
                     let new_relation = SenseRelation { target, rel_type };
                     if !sense_entry.sense_relations.contains(&new_relation) {
@@ -389,34 +405,45 @@ impl WordNet {
         Ok(final_entries)
     }
 
-
     /// Retrieves a specific Synset by its ID string.
     /// Returns an owned Synset struct fetched from the DB.
     pub fn get_synset(&self, id: &str) -> Result<Synset> {
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
-        self.fetch_full_synset_by_id(&*conn_guard, id)?
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        self.fetch_full_synset_by_id(&conn_guard, id)?
             .ok_or_else(|| OewnError::SynsetNotFound(id.to_string()))
     }
 
     /// Retrieves a specific Sense by its ID string.
     /// Returns an owned Sense struct fetched from the DB.
     pub fn get_sense(&self, id: &str) -> Result<Sense> {
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
-        self.fetch_full_sense_by_id(&*conn_guard, id)?
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        self.fetch_full_sense_by_id(&conn_guard, id)?
             .ok_or_else(|| OewnError::Internal(format!("Sense ID not found: {}", id))) // Should not happen if DB is consistent
     }
 
     /// Retrieves all Senses associated with a specific Lexical Entry ID.
     /// Returns owned Sense structs fetched from the DB.
     pub fn get_senses_for_entry(&self, entry_id: &str) -> Result<Vec<Sense>> {
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
-        self.fetch_senses_for_entry_internal(&*conn_guard, entry_id)
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        self.fetch_senses_for_entry_internal(&conn_guard, entry_id)
     }
 
     /// Retrieves all Senses (including their relations) associated with a specific Synset ID using JOINs.
     /// Returns owned Sense structs fetched from the DB.
     pub fn get_senses_for_synset(&self, synset_id: &str) -> Result<Vec<Sense>> {
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
 
         let sql = "
@@ -431,7 +458,8 @@ impl WordNet {
         let mut stmt = conn.prepare(sql)?;
 
         // Use a HashMap to group relations by sense ID during iteration
-        let mut senses_map: std::collections::HashMap<String, Sense> = std::collections::HashMap::new();
+        let mut senses_map: std::collections::HashMap<String, Sense> =
+            std::collections::HashMap::new();
 
         let rows_iter = stmt.query_map(params![synset_id], |row| {
             // Extract data from the row
@@ -445,14 +473,18 @@ impl WordNet {
             let sense_entry = senses_map.entry(sense_id.clone()).or_insert_with(|| Sense {
                 id: sense_id.clone(),
                 synset: current_synset_id, // Use the value from the row
-                subcat: subcat,
+                subcat,
                 sense_relations: Vec::new(), // Initialize relations vector
             });
 
             // If relation data exists (due to LEFT JOIN), parse and add it
             if let (Some(target), Some(rel_str)) = (target_sense_id, rel_type_str) {
                 let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?;
                 // Avoid adding duplicate relations if a sense has multiple relations of the same type to the same target
                 let new_relation = SenseRelation { target, rel_type };
@@ -476,17 +508,24 @@ impl WordNet {
     /// Retrieves a random lexical entry.
     /// Returns an owned LexicalEntry struct fetched from the DB.
     pub fn get_random_entry(&self) -> Result<LexicalEntry> {
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
 
         // Get a random entry ID first
-        let mut stmt_id = conn.prepare("SELECT id FROM lexical_entries ORDER BY RANDOM() LIMIT 1")?;
+        let mut stmt_id =
+            conn.prepare("SELECT id FROM lexical_entries ORDER BY RANDOM() LIMIT 1")?;
         let random_id_opt: Option<String> = stmt_id.query_row([], |row| row.get(0)).optional()?;
 
         match random_id_opt {
-            Some(id) => self.fetch_full_entry_by_id(conn, &id)?
+            Some(id) => self
+                .fetch_full_entry_by_id(conn, &id)?
                 .ok_or_else(|| OewnError::Internal(format!("Random entry ID {} not found.", id))), // Should not happen
-            None => Err(OewnError::Internal("No entries found in database.".to_string())),
+            None => Err(OewnError::Internal(
+                "No entries found in database.".to_string(),
+            )),
         }
     }
 
@@ -494,8 +533,13 @@ impl WordNet {
     /// Note: This fetches the entire dataset into memory and can be very resource-intensive. Use with caution.
     /// Returns owned LexicalEntry structs fetched from the DB.
     pub fn all_entries(&self) -> Result<Vec<LexicalEntry>> {
-        warn!("all_entries() (optimized) called: Fetching all entries and related data from DB. This might be slow and very memory-intensive.");
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        warn!(
+            "all_entries() (optimized) called: Fetching all entries and related data from DB. This might be slow and very memory-intensive."
+        );
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
 
         // Single query joining entries, pronunciations, senses, and sense relations for ALL entries
@@ -514,29 +558,48 @@ impl WordNet {
         let mut stmt = conn.prepare(sql)?;
 
         // Use HashMaps to aggregate data during iteration
-        let mut entries_map: std::collections::HashMap<String, LexicalEntry> = std::collections::HashMap::new();
+        let mut entries_map: std::collections::HashMap<String, LexicalEntry> =
+            std::collections::HashMap::new();
         // Temporary storage for multi-valued fields, keyed by entry_id
-        let mut temp_pronunciations: std::collections::HashMap<String, std::collections::HashSet<Pronunciation>> = std::collections::HashMap::new();
+        let mut temp_pronunciations: std::collections::HashMap<
+            String,
+            std::collections::HashSet<Pronunciation>,
+        > = std::collections::HashMap::new();
         // Temporary storage for senses, keyed by entry_id, then sense_id
-        let mut temp_senses: std::collections::HashMap<String, std::collections::HashMap<String, Sense>> = std::collections::HashMap::new();
+        let mut temp_senses: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Sense>,
+        > = std::collections::HashMap::new();
 
-        let rows_iter = stmt.query_map([], |row| { // No parameters needed for all_entries
+        let rows_iter = stmt.query_map([], |row| {
+            // No parameters needed for all_entries
             // --- Extract Core Entry Data ---
             let entry_id: String = row.get("entry_id")?;
             let lemma_written_form: String = row.get("lemma_written_form")?;
             let part_of_speech_str: String = row.get("part_of_speech")?;
-            let part_of_speech = string_to_part_of_speech(&part_of_speech_str)
-                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+            let part_of_speech = string_to_part_of_speech(&part_of_speech_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
 
             // --- Create or Get Entry in Map ---
-             // Prefix with _ as the variable itself isn't used directly after insertion/retrieval
-            let _entry_map_entry = entries_map.entry(entry_id.clone()).or_insert_with(|| LexicalEntry {
-                id: entry_id.clone(),
-                lemma: Lemma { written_form: lemma_written_form, part_of_speech },
-                pronunciations: Vec::new(),
-                senses: Vec::new(),
-                syntactic_behaviours: Vec::new(),
-            });
+            // Prefix with _ as the variable itself isn't used directly after insertion/retrieval
+            let _entry_map_entry =
+                entries_map
+                    .entry(entry_id.clone())
+                    .or_insert_with(|| LexicalEntry {
+                        id: entry_id.clone(),
+                        lemma: Lemma {
+                            written_form: lemma_written_form,
+                            part_of_speech,
+                        },
+                        pronunciations: Vec::new(),
+                        senses: Vec::new(),
+                        syntactic_behaviours: Vec::new(),
+                    });
 
             // --- Extract and Store Pronunciation ---
             let pron_variety: Option<String> = row.get("variety")?;
@@ -545,19 +608,23 @@ impl WordNet {
                 let pron_phonemic_int: Option<i64> = row.get("phonemic")?;
                 let pron_audio: Option<String> = row.get("audio")?;
                 let pron_text: Option<String> = row.get("pron_text")?;
-                 if let (Some(ph_int), Some(txt)) = (pron_phonemic_int, pron_text) {
-                     temp_pronunciations.entry(entry_id.clone())
-                         .or_default()
-                         .insert(Pronunciation {
-                             variety: var,
-                             notation: pron_notation,
-                             phonemic: ph_int != 0,
-                             audio: pron_audio,
-                             text: txt,
-                         });
-                 } else {
-                      warn!("Incomplete pronunciation data found during all_entries for entry {}", entry_id);
-                 }
+                if let (Some(ph_int), Some(txt)) = (pron_phonemic_int, pron_text) {
+                    temp_pronunciations
+                        .entry(entry_id.clone())
+                        .or_default()
+                        .insert(Pronunciation {
+                            variety: var,
+                            notation: pron_notation,
+                            phonemic: ph_int != 0,
+                            audio: pron_audio,
+                            text: txt,
+                        });
+                } else {
+                    warn!(
+                        "Incomplete pronunciation data found during all_entries for entry {}",
+                        entry_id
+                    );
+                }
             }
 
             // --- Extract and Store Sense and Sense Relation ---
@@ -569,18 +636,24 @@ impl WordNet {
                 let sense_rel_type_str: Option<String> = row.get("sense_rel_type")?;
 
                 // Get or create the sense within the entry's sense map
-                 let entry_senses = temp_senses.entry(entry_id.clone()).or_default();
-                 let sense_entry = entry_senses.entry(sense_id.clone()).or_insert_with(|| Sense {
-                     id: sense_id.clone(),
-                     synset: synset_id,
-                     subcat: subcat,
-                     sense_relations: Vec::new(),
-                 });
+                let entry_senses = temp_senses.entry(entry_id.clone()).or_default();
+                let sense_entry = entry_senses
+                    .entry(sense_id.clone())
+                    .or_insert_with(|| Sense {
+                        id: sense_id.clone(),
+                        synset: synset_id,
+                        subcat,
+                        sense_relations: Vec::new(),
+                    });
 
                 // Add relation if present
                 if let (Some(target), Some(rel_str)) = (sense_rel_target, sense_rel_type_str) {
                     let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e)) // Adjust index if needed
+                        rusqlite::Error::FromSqlConversionFailure(
+                            12,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        ) // Adjust index if needed
                     })?;
                     let new_relation = SenseRelation { target, rel_type };
                     if !sense_entry.sense_relations.contains(&new_relation) {
@@ -598,12 +671,12 @@ impl WordNet {
         for result in rows_iter {
             result?;
             row_count += 1;
-            if row_count % 100000 == 0 { // Log progress periodically
-                 info!("Processed {} rows for all_entries...", row_count);
+            if row_count % 100000 == 0 {
+                // Log progress periodically
+                info!("Processed {} rows for all_entries...", row_count);
             }
         }
-         info!("Finished processing {} rows for all_entries.", row_count);
-
+        info!("Finished processing {} rows for all_entries.", row_count);
 
         // Populate the final entries from the aggregated data
         info!("Aggregating final entry data...");
@@ -626,22 +699,34 @@ impl WordNet {
 
     /// Retrieves the entry ID for a given sense ID.
     pub fn get_entry_id_for_sense(&self, sense_id: &str) -> Result<Option<String>> {
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
         let mut stmt = conn.prepare("SELECT entry_id FROM senses WHERE id = ?1")?;
-        stmt.query_row(params![sense_id], |row| row.get(0)).optional().map_err(OewnError::from)
+        stmt.query_row(params![sense_id], |row| row.get(0))
+            .optional()
+            .map_err(OewnError::from)
     }
 
     /// Retrieves an entry by its ID.
     /// Returns an owned LexicalEntry struct fetched from the DB.
     pub fn get_entry_by_id(&self, entry_id: &str) -> Result<Option<LexicalEntry>> {
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
-        self.fetch_full_entry_by_id(&*conn_guard, entry_id)
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        self.fetch_full_entry_by_id(&conn_guard, entry_id)
     }
 
     /// Internal helper to fetch full LexicalEntry data including pronunciations and senses.
     /// Fetches entry + pronunciations with JOIN, then calls optimized sense fetcher.
-    fn fetch_full_entry_by_id(&self, conn: &Connection, entry_id: &str) -> Result<Option<LexicalEntry>> {
+    fn fetch_full_entry_by_id(
+        &self,
+        conn: &Connection,
+        entry_id: &str,
+    ) -> Result<Option<LexicalEntry>> {
         let sql = "
             SELECT
                 le.id, le.lemma_written_form, le.part_of_speech,
@@ -653,7 +738,8 @@ impl WordNet {
         let mut stmt = conn.prepare(sql)?;
 
         let mut entry_opt: Option<LexicalEntry> = None;
-        let mut pronunciations_temp: std::collections::HashSet<Pronunciation> = std::collections::HashSet::new(); // Use HashSet for uniqueness
+        let mut pronunciations_temp: std::collections::HashSet<Pronunciation> =
+            std::collections::HashSet::new(); // Use HashSet for uniqueness
 
         let rows_iter = stmt.query_map(params![entry_id], |row| {
             // Extract core entry data (only needed once)
@@ -664,32 +750,33 @@ impl WordNet {
                 entry_opt = Some(LexicalEntry {
                     id: id.clone(),
                     lemma,
-                    pronunciations: Vec::new(), // Initialize
-                    senses: Vec::new(),         // Initialize
+                    pronunciations: Vec::new(),       // Initialize
+                    senses: Vec::new(),               // Initialize
                     syntactic_behaviours: Vec::new(), // TODO: Fetch if needed
                 });
             }
 
             // Extract pronunciation data (if present in this row)
             let variety: Option<String> = row.get(3)?;
-            if let Some(var) = variety { // Check if pronunciation exists for this row
+            if let Some(var) = variety {
+                // Check if pronunciation exists for this row
                 let notation: Option<String> = row.get(4)?;
                 let phonemic_int: Option<i64> = row.get(5)?;
                 let audio: Option<String> = row.get(6)?;
                 let text: Option<String> = row.get(7)?; // Renamed to pron_text in SQL
 
                 // Ensure required fields are present (variety and text should be NOT NULL in schema ideally)
-                 if let (Some(ph_int), Some(txt)) = (phonemic_int, text) {
-                     pronunciations_temp.insert(Pronunciation {
-                         variety: var,
-                         notation,
-                         phonemic: ph_int != 0,
-                         audio,
-                         text: txt,
-                     });
-                 } else {
-                      warn!("Incomplete pronunciation data found for entry {}", entry_id);
-                 }
+                if let (Some(ph_int), Some(txt)) = (phonemic_int, text) {
+                    pronunciations_temp.insert(Pronunciation {
+                        variety: var,
+                        notation,
+                        phonemic: ph_int != 0,
+                        audio,
+                        text: txt,
+                    });
+                } else {
+                    warn!("Incomplete pronunciation data found for entry {}", entry_id);
+                }
             }
             Ok(())
         })?;
@@ -710,7 +797,11 @@ impl WordNet {
     }
 
     /// Internal helper to fetch senses and their relations for a given entry ID using a JOIN.
-    fn fetch_senses_for_entry_internal(&self, conn: &Connection, entry_id: &str) -> Result<Vec<Sense>> {
+    fn fetch_senses_for_entry_internal(
+        &self,
+        conn: &Connection,
+        entry_id: &str,
+    ) -> Result<Vec<Sense>> {
         let sql = "
             SELECT
                 s.id, s.synset_id, s.subcat,
@@ -723,7 +814,8 @@ impl WordNet {
         let mut stmt = conn.prepare(sql)?;
 
         // Use a HashMap to group relations by sense ID during iteration
-        let mut senses_map: std::collections::HashMap<String, Sense> = std::collections::HashMap::new();
+        let mut senses_map: std::collections::HashMap<String, Sense> =
+            std::collections::HashMap::new();
 
         let rows_iter = stmt.query_map(params![entry_id], |row| {
             // Extract data from the row
@@ -737,16 +829,22 @@ impl WordNet {
             let sense_entry = senses_map.entry(sense_id.clone()).or_insert_with(|| Sense {
                 id: sense_id.clone(),
                 synset: synset_id,
-                subcat: subcat,
+                subcat,
                 sense_relations: Vec::new(), // Initialize relations vector
             });
 
             // If relation data exists (due to LEFT JOIN), parse and add it
             if let (Some(target), Some(rel_str)) = (target_sense_id, rel_type_str) {
                 let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?;
-                sense_entry.sense_relations.push(SenseRelation { target, rel_type });
+                sense_entry
+                    .sense_relations
+                    .push(SenseRelation { target, rel_type });
             }
 
             Ok(()) // query_map expects a Result, Ok(()) indicates success for this row processing
@@ -758,20 +856,17 @@ impl WordNet {
             result?; // Propagate any error from query_map closure or DB interaction
         }
 
-
         // Convert the map values (Senses) into a Vec
         Ok(senses_map.into_values().collect())
     }
 
-
     /// Retrieves related Senses (including their relations) for a given source Sense ID and relation type using JOINs.
     /// Returns owned Sense structs fetched from the DB.
-    pub fn get_related_senses(
-        &self,
-        sense_id: &str,
-        rel_type: SenseRelType,
-    ) -> Result<Vec<Sense>> {
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+    pub fn get_related_senses(&self, sense_id: &str, rel_type: SenseRelType) -> Result<Vec<Sense>> {
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
 
         let rel_type_str = db::sense_rel_type_to_string(rel_type);
@@ -791,7 +886,8 @@ impl WordNet {
         ";
         let mut stmt = conn.prepare(sql)?;
 
-        let mut senses_map: std::collections::HashMap<String, Sense> = std::collections::HashMap::new();
+        let mut senses_map: std::collections::HashMap<String, Sense> =
+            std::collections::HashMap::new();
 
         let rows_iter = stmt.query_map(params![sense_id, rel_type_str], |row| {
             // Extract target sense data
@@ -802,22 +898,34 @@ impl WordNet {
             let target_rel_type_str: Option<String> = row.get(4)?;
 
             // Create or get the target Sense struct
-            let sense_entry = senses_map.entry(target_sense_id.clone()).or_insert_with(|| Sense {
-                id: target_sense_id.clone(),
-                synset: target_synset_id,
-                subcat: target_subcat,
-                sense_relations: Vec::new(),
-            });
+            let sense_entry = senses_map
+                .entry(target_sense_id.clone())
+                .or_insert_with(|| Sense {
+                    id: target_sense_id.clone(),
+                    synset: target_synset_id,
+                    subcat: target_subcat,
+                    sense_relations: Vec::new(),
+                });
 
             // If relation data *for the target sense* exists, parse and add it
-            if let (Some(target_rel_target), Some(target_rel_str)) = (target_rel_target_id, target_rel_type_str) {
+            if let (Some(target_rel_target), Some(target_rel_str)) =
+                (target_rel_target_id, target_rel_type_str)
+            {
                 let rel_type = string_to_sense_rel_type(&target_rel_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?;
-                 let new_relation = SenseRelation { target: target_rel_target, rel_type };
-                 if !sense_entry.sense_relations.contains(&new_relation) { // Avoid duplicates
-                     sense_entry.sense_relations.push(new_relation);
-                 }
+                let new_relation = SenseRelation {
+                    target: target_rel_target,
+                    rel_type,
+                };
+                if !sense_entry.sense_relations.contains(&new_relation) {
+                    // Avoid duplicates
+                    sense_entry.sense_relations.push(new_relation);
+                }
             }
             Ok(())
         })?;
@@ -830,7 +938,7 @@ impl WordNet {
         Ok(senses_map.into_values().collect())
     }
 
-     /// Internal helper to fetch full Sense data including relations using a JOIN.
+    /// Internal helper to fetch full Sense data including relations using a JOIN.
     fn fetch_full_sense_by_id(&self, conn: &Connection, sense_id: &str) -> Result<Option<Sense>> {
         let sql = "
             SELECT
@@ -858,7 +966,7 @@ impl WordNet {
                 sense_opt = Some(Sense {
                     id: current_sense_id.clone(),
                     synset: synset_id,
-                    subcat: subcat,
+                    subcat,
                     sense_relations: Vec::new(), // Initialize relations vector
                 });
             }
@@ -866,7 +974,11 @@ impl WordNet {
             // If relation data exists (due to LEFT JOIN), parse and add it to temp vec
             if let (Some(target), Some(rel_str)) = (target_sense_id, rel_type_str) {
                 let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?;
                 relations_temp.push(SenseRelation { target, rel_type });
             }
@@ -887,7 +999,6 @@ impl WordNet {
         Ok(sense_opt)
     }
 
-
     /// Retrieves related Synsets (including their definitions, examples, relations) for a given source Synset ID and relation type using JOINs.
     /// Returns owned Synset structs fetched from the DB.
     pub fn get_related_synsets(
@@ -895,7 +1006,10 @@ impl WordNet {
         synset_id: &str,
         rel_type: SynsetRelType,
     ) -> Result<Vec<Synset>> {
-        let conn_guard = self.conn.lock().map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        let conn_guard = self
+            .conn
+            .lock()
+            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
         let conn = &*conn_guard;
 
         let rel_type_str = db::synset_rel_type_to_string(rel_type);
@@ -921,38 +1035,58 @@ impl WordNet {
         ";
         let mut stmt = conn.prepare(sql)?;
 
-        let mut synsets_map: std::collections::HashMap<String, Synset> = std::collections::HashMap::new();
+        let mut synsets_map: std::collections::HashMap<String, Synset> =
+            std::collections::HashMap::new();
         // Temporary storage for multi-valued fields within the map processing closure
-        let mut temp_defs: std::collections::HashMap<String, std::collections::HashSet<Definition>> = std::collections::HashMap::new();
-        let mut temp_examples: std::collections::HashMap<String, std::collections::HashSet<Example>> = std::collections::HashMap::new();
-        let mut temp_relations: std::collections::HashMap<String, std::collections::HashSet<SynsetRelation>> = std::collections::HashMap::new();
+        let mut temp_defs: std::collections::HashMap<
+            String,
+            std::collections::HashSet<Definition>,
+        > = std::collections::HashMap::new();
+        let mut temp_examples: std::collections::HashMap<
+            String,
+            std::collections::HashSet<Example>,
+        > = std::collections::HashMap::new();
+        let mut temp_relations: std::collections::HashMap<
+            String,
+            std::collections::HashSet<SynsetRelation>,
+        > = std::collections::HashMap::new();
 
         let rows_iter = stmt.query_map(params![synset_id, rel_type_str], |row| {
             // Extract target synset core data
             let target_id: String = row.get(0)?;
             let target_ili: Option<String> = row.get(1)?;
             let target_pos_str: String = row.get(2)?;
-            let target_part_of_speech = string_to_part_of_speech(&target_pos_str)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+            let target_part_of_speech = string_to_part_of_speech(&target_pos_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
 
             // Create or get the target Synset struct (without multi-valued fields initially)
-            let synset_entry = synsets_map.entry(target_id.clone()).or_insert_with(|| Synset {
-                id: target_id.clone(),
-                ili: target_ili,
-                part_of_speech: target_part_of_speech,
-                definitions: Vec::new(),
-                ili_definition: None, // Will be set below if found
-                examples: Vec::new(),
-                synset_relations: Vec::new(),
-                members: String::new(),
-            });
+            let synset_entry = synsets_map
+                .entry(target_id.clone())
+                .or_insert_with(|| Synset {
+                    id: target_id.clone(),
+                    ili: target_ili,
+                    part_of_speech: target_part_of_speech,
+                    definitions: Vec::new(),
+                    ili_definition: None, // Will be set below if found
+                    examples: Vec::new(),
+                    synset_relations: Vec::new(),
+                    members: String::new(),
+                });
 
             // Extract ILI definition (only needs to be done once per synset)
             if synset_entry.ili_definition.is_none() {
                 let ili_text: Option<String> = row.get(5)?;
                 let ili_source: Option<String> = row.get(6)?;
                 if let Some(text) = ili_text {
-                    synset_entry.ili_definition = Some(ILIDefinition { text, dc_source: ili_source });
+                    synset_entry.ili_definition = Some(ILIDefinition {
+                        text,
+                        dc_source: ili_source,
+                    });
                 }
             }
 
@@ -960,18 +1094,26 @@ impl WordNet {
             let def_text: Option<String> = row.get(3)?;
             let def_source: Option<String> = row.get(4)?;
             if let Some(text) = def_text {
-                 temp_defs.entry(target_id.clone())
-                     .or_default()
-                     .insert(Definition { text, dc_source: def_source });
+                temp_defs
+                    .entry(target_id.clone())
+                    .or_default()
+                    .insert(Definition {
+                        text,
+                        dc_source: def_source,
+                    });
             }
 
             // Extract and store examples
             let ex_text: Option<String> = row.get(7)?;
             let ex_source: Option<String> = row.get(8)?;
             if let Some(text) = ex_text {
-                 temp_examples.entry(target_id.clone())
-                     .or_default()
-                     .insert(Example { text, dc_source: ex_source });
+                temp_examples
+                    .entry(target_id.clone())
+                    .or_default()
+                    .insert(Example {
+                        text,
+                        dc_source: ex_source,
+                    });
             }
 
             // Extract and store relations
@@ -979,11 +1121,16 @@ impl WordNet {
             let target_rel_type_str: Option<String> = row.get(10)?;
             if let (Some(target), Some(rel_str)) = (target_rel_target_id, target_rel_type_str) {
                 let rel_type = string_to_synset_rel_type(&rel_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?;
-                 temp_relations.entry(target_id.clone())
-                     .or_default()
-                     .insert(SynsetRelation { target, rel_type });
+                temp_relations
+                    .entry(target_id.clone())
+                    .or_default()
+                    .insert(SynsetRelation { target, rel_type });
             }
 
             Ok(())
@@ -1013,7 +1160,11 @@ impl WordNet {
     // --- Internal Helper Methods ---
 
     /// Internal helper to fetch full Synset data including relations, definitions, examples using JOINs.
-    fn fetch_full_synset_by_id(&self, conn: &Connection, synset_id: &str) -> Result<Option<Synset>> {
+    fn fetch_full_synset_by_id(
+        &self,
+        conn: &Connection,
+        synset_id: &str,
+    ) -> Result<Option<Synset>> {
         // This query joins synsets with definitions, ili_definitions, examples, and synset_relations.
         // LEFT JOINs are used to ensure the synset is returned even if it has no definitions, examples, etc.
         let sql = "
@@ -1034,9 +1185,12 @@ impl WordNet {
 
         let mut synset_opt: Option<Synset> = None;
         // Use HashSets to avoid duplicates when multiple relations/defs/examples exist
-        let mut definitions_temp: std::collections::HashSet<Definition> = std::collections::HashSet::new();
-        let mut examples_temp: std::collections::HashSet<Example> = std::collections::HashSet::new();
-        let mut relations_temp: std::collections::HashSet<SynsetRelation> = std::collections::HashSet::new();
+        let mut definitions_temp: std::collections::HashSet<Definition> =
+            std::collections::HashSet::new();
+        let mut examples_temp: std::collections::HashSet<Example> =
+            std::collections::HashSet::new();
+        let mut relations_temp: std::collections::HashSet<SynsetRelation> =
+            std::collections::HashSet::new();
         let mut ili_definition_temp: Option<ILIDefinition> = None;
 
         let rows_iter = stmt.query_map(params![synset_id], |row| {
@@ -1045,8 +1199,13 @@ impl WordNet {
                 let id: String = row.get(0)?;
                 let ili: Option<String> = row.get(1)?;
                 let pos_str: String = row.get(2)?;
-                let part_of_speech = string_to_part_of_speech(&pos_str)
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+                let part_of_speech = string_to_part_of_speech(&pos_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
 
                 synset_opt = Some(Synset {
                     id: id.clone(),
@@ -1063,7 +1222,10 @@ impl WordNet {
                 let ili_text: Option<String> = row.get(5)?;
                 let ili_source: Option<String> = row.get(6)?;
                 if let Some(text) = ili_text {
-                    ili_definition_temp = Some(ILIDefinition { text, dc_source: ili_source });
+                    ili_definition_temp = Some(ILIDefinition {
+                        text,
+                        dc_source: ili_source,
+                    });
                 }
             }
 
@@ -1071,14 +1233,20 @@ impl WordNet {
             let def_text: Option<String> = row.get(3)?;
             let def_source: Option<String> = row.get(4)?;
             if let Some(text) = def_text {
-                definitions_temp.insert(Definition { text, dc_source: def_source });
+                definitions_temp.insert(Definition {
+                    text,
+                    dc_source: def_source,
+                });
             }
 
             // Extract example data (if present)
             let ex_text: Option<String> = row.get(7)?;
             let ex_source: Option<String> = row.get(8)?;
             if let Some(text) = ex_text {
-                examples_temp.insert(Example { text, dc_source: ex_source });
+                examples_temp.insert(Example {
+                    text,
+                    dc_source: ex_source,
+                });
             }
 
             // Extract relation data (if present)
@@ -1086,7 +1254,11 @@ impl WordNet {
             let rel_type_str: Option<String> = row.get(10)?;
             if let (Some(target), Some(rel_str)) = (target_synset_id, rel_type_str) {
                 let rel_type = string_to_synset_rel_type(&rel_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?;
                 relations_temp.insert(SynsetRelation { target, rel_type });
             }
@@ -1133,13 +1305,12 @@ fn row_to_lemma(row: &Row) -> std::result::Result<Lemma, rusqlite::Error> {
 // Add similar row_to_... functions for LexicalEntry, Sense, Synset, etc.
 // These functions will often need the Connection to fetch related data (e.g., senses for an entry).
 
-
 #[cfg(test)]
 mod tests {
     // Tests need to be rewritten for the SQLite backend.
 
     use super::*;
-    use std::path::PathBuf;
+
     use tempfile::tempdir;
 
     // Placeholder test function
@@ -1186,5 +1357,4 @@ mod tests {
         // assert!(WordNet::clear_database(Some(db_path.clone())).is_ok());
         // assert!(!db_path.exists());
     }
-
 }

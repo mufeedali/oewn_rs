@@ -1,7 +1,7 @@
 use crate::error::{OewnError, Result};
 use crate::models::{LexicalResource, PartOfSpeech, SenseRelType, SynsetRelType};
 use log::{debug, info, warn};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::time::Instant;
 
 // --- Schema Definition ---
@@ -119,8 +119,7 @@ CREATE TABLE IF NOT EXISTS synset_relations (
 
 // --- Indices ---
 
-const CREATE_ENTRY_LEMMA_LOWER_INDEX: &str =
-    "CREATE INDEX IF NOT EXISTS idx_entry_lemma_lower ON lexical_entries (lemma_written_form_lower);";
+const CREATE_ENTRY_LEMMA_LOWER_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_entry_lemma_lower ON lexical_entries (lemma_written_form_lower);";
 const CREATE_ENTRY_POS_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_entry_pos ON lexical_entries (part_of_speech);";
 const CREATE_ENTRY_LEMMA_POS_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_entry_lemma_pos ON lexical_entries (lemma_written_form_lower, part_of_speech);";
@@ -128,8 +127,7 @@ const CREATE_SENSE_SYNSET_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_sense_synset ON senses (synset_id);";
 const CREATE_SENSE_ENTRY_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_sense_entry ON senses (entry_id);";
-const CREATE_SENSE_REL_SOURCE_TYPE_INDEX: &str =
-    "CREATE INDEX IF NOT EXISTS idx_sense_rel_source_type ON sense_relations (source_sense_id, rel_type);";
+const CREATE_SENSE_REL_SOURCE_TYPE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_sense_rel_source_type ON sense_relations (source_sense_id, rel_type);";
 const CREATE_SYNSET_REL_SOURCE_TYPE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_synset_rel_source_type ON synset_relations (source_synset_id, rel_type);";
 const CREATE_DEFINITION_SYNSET_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_definition_synset ON definitions (synset_id);";
@@ -143,7 +141,10 @@ const CREATE_PRONUNCIATION_ENTRY_INDEX: &str =
 /// Creates all necessary tables and indices in the database if they don't exist.
 /// Also checks and sets the schema version.
 pub fn initialize_database(conn: &mut Connection) -> Result<()> {
-    info!("Initializing database schema (version {})...", SCHEMA_VERSION);
+    info!(
+        "Initializing database schema (version {})...",
+        SCHEMA_VERSION
+    );
     let tx = conn.transaction()?;
 
     // Create tables
@@ -185,7 +186,10 @@ pub fn initialize_database(conn: &mut Connection) -> Result<()> {
         Some(v_str) => {
             let existing_version: u32 = v_str.parse().map_err(|e| {
                 // Use ParseError for parsing issues
-                OewnError::ParseError(format!("Failed to parse existing schema version '{}': {}", v_str, e))
+                OewnError::ParseError(format!(
+                    "Failed to parse existing schema version '{}': {}",
+                    v_str, e
+                ))
             })?;
             if existing_version < SCHEMA_VERSION {
                 warn!(
@@ -197,14 +201,17 @@ pub fn initialize_database(conn: &mut Connection) -> Result<()> {
                     "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
                 )?;
-                 info!("Updated schema version in metadata table.");
+                info!("Updated schema version in metadata table.");
             } else if existing_version > SCHEMA_VERSION {
-                 warn!(
+                warn!(
                     "Database schema version ({}) is newer than expected ({}). Using potentially incompatible schema.",
                     existing_version, SCHEMA_VERSION
                 );
             } else {
-                debug!("Database schema version ({}) matches expected version.", existing_version);
+                debug!(
+                    "Database schema version ({}) matches expected version.",
+                    existing_version
+                );
             }
         }
         None => {
@@ -334,7 +341,7 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
             for sense in &entry.senses {
                 sense_stmt.execute(params![
                     sense.id,
-                    entry.id, // Foreign key
+                    entry.id,     // Foreign key
                     sense.synset, // Foreign key (references synset.id)
                     sense.subcat,
                 ])?;
@@ -376,8 +383,8 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
             for sense in &entry.senses {
                 for relation in &sense.sense_relations {
                     sense_rel_stmt.execute(params![
-                        sense.id, // Source sense
-                        relation.target, // Target sense ID
+                        sense.id,                                    // Source sense
+                        relation.target,                             // Target sense ID
                         sense_rel_type_to_string(relation.rel_type), // Store type as string
                     ])?;
                 }
@@ -386,8 +393,8 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
         for synset in &lexicon.synsets {
             for relation in &synset.synset_relations {
                 synset_rel_stmt.execute(params![
-                    synset.id, // Source synset
-                    relation.target, // Target synset ID
+                    synset.id,                                    // Source synset
+                    relation.target,                              // Target synset ID
                     synset_rel_type_to_string(relation.rel_type), // Store type as string
                 ])?;
             }
@@ -436,7 +443,6 @@ pub fn clear_database_data(tx: &Transaction) -> Result<()> {
     Ok(())
 }
 
-
 // --- Enum to String Conversion Helpers ---
 
 pub(crate) fn part_of_speech_to_string(pos: PartOfSpeech) -> &'static str {
@@ -465,7 +471,10 @@ pub fn string_to_part_of_speech(s: &str) -> Result<PartOfSpeech> {
         "x" => Ok(PartOfSpeech::X),
         "u" => Ok(PartOfSpeech::U),
         // Use ParseError for invalid string values from DB
-        _ => Err(OewnError::ParseError(format!("Invalid PartOfSpeech string in DB: {}", s))),
+        _ => Err(OewnError::ParseError(format!(
+            "Invalid PartOfSpeech string in DB: {}",
+            s
+        ))),
     }
 }
 
