@@ -23,11 +23,11 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Path to a custom cache file (optional)
+    /// Path to a custom database file (optional)
     #[arg(long)]
-    cache_path: Option<String>,
+    db_path: Option<String>,
 
-    /// Force reload data, ignoring cache
+    /// Force reload data, ignoring existing database content
     #[arg(long, default_value_t = false)]
     force_reload: bool,
 
@@ -47,8 +47,8 @@ enum Commands {
     },
     /// Show a random word
     Random,
-    /// Clear the WordNet cache
-    ClearCache,
+    /// Clear the WordNet database
+    ClearDb,
 }
 
 // --- Main Function ---
@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     // --- Load WordNet Data ---
     info!("Loading WordNet data...");
     let load_options = LoadOptions {
-        cache_path: cli.cache_path.as_ref().map(PathBuf::from), // Use as_ref() to borrow
+        db_path: cli.db_path.as_ref().map(PathBuf::from), // Use db_path
         force_reload: cli.force_reload,
     };
     let wn = match WordNet::load_with_options(load_options).await {
@@ -107,21 +107,21 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::ClearCache => {
-            info!("Clearing cache...");
-            // Use the same logic as loading to determine which cache path to clear
-            let cache_path_to_clear = if let Some(custom_path) = cli.cache_path {
+        Commands::ClearDb => {
+            info!("Clearing database...");
+            // Use the same logic as loading to determine which db path to clear
+            let db_path_to_clear = if let Some(custom_path) = cli.db_path {
                 Some(PathBuf::from(custom_path))
             } else {
                 // Try to get default path, ignore error if it fails (e.g., dir not found yet)
-                WordNet::get_default_cache_path().ok()
+                WordNet::get_default_db_path().ok() // Use get_default_db_path
             };
 
-            match WordNet::clear_cache(cache_path_to_clear) {
-                Ok(_) => println!("{}", "Cache cleared successfully.".green()),
+            match WordNet::clear_database(db_path_to_clear) {
+                Ok(_) => println!("{}", "Database cleared successfully.".green()),
                 Err(e) => {
-                    error!("Failed to clear cache: {}", e);
-                    eprintln!("{}", format!("Error clearing cache: {}", e).red());
+                    error!("Failed to clear database: {}", e);
+                    eprintln!("{}", format!("Error clearing database: {}", e).red());
                     std::process::exit(1);
                 }
             }
@@ -149,7 +149,7 @@ async fn handle_define(wn: &WordNet, word: &str, pos_filter: Option<PartOfSpeech
     }
 
     // Group entries by lemma form and part of speech for structured output
-    let mut grouped_entries: HashMap<(String, PartOfSpeech), Vec<&LexicalEntry>> = HashMap::new();
+    let mut grouped_entries: HashMap<(String, PartOfSpeech), Vec<LexicalEntry>> = HashMap::new();
     for entry in entries {
         grouped_entries
             .entry((entry.lemma.written_form.clone(), entry.lemma.part_of_speech))
@@ -159,11 +159,11 @@ async fn handle_define(wn: &WordNet, word: &str, pos_filter: Option<PartOfSpeech
 
     // Sort groups for consistent output
     let mut sorted_groups: Vec<_> = grouped_entries.into_iter().collect();
-    sorted_groups.sort_by(|a, b| a.0.cmp(&b.0)); // Sort by (lemma, pos) tuple
+    sorted_groups.sort_by(|a, b| a.0.cmp(&b.0));
     for ((lemma_form, pos), entries_for_group) in sorted_groups {
         println!(
             "\n{} ~ {}",
-            lemma_form.bold().cyan(), // Use cyan for lemma
+            lemma_form.bold().cyan(),
             pos.to_string().italic()  // Italic for POS
         );
 
@@ -188,8 +188,8 @@ async fn handle_define(wn: &WordNet, word: &str, pos_filter: Option<PartOfSpeech
                 let start_sense_processing = Instant::now();
                 match wn.get_synset(&sense.synset) {
                     Ok(synset) => {
-                        // Pass the current lemma_form to the printing function (sense removed)
-                        print_sense_details(wn, &lemma_form, synset, sense_counter)?;
+                        // Pass the current lemma_form and the owned synset
+                        print_sense_details(wn, &lemma_form, &synset, sense_counter)?;
                         sense_counter += 1;
                         debug!(
                             "Processing sense {} / synset {} took: {:?}",
@@ -220,7 +220,7 @@ fn print_sense_details(
     counter: usize,
 ) -> Result<()> {
     // 1. Print Definition(s)
-    for def in &synset.definitions {
+    for def in &synset.definitions { // No change needed here
         // Indent definition
         println!("  {}: {}", counter.to_string().bold(), def.text.trim());
     }
@@ -242,9 +242,9 @@ fn print_sense_details(
     let mut synonyms = Vec::new();
     for member_sense in member_senses {
         // Use the helper method to find the entry ID
-        if let Some(entry_id) = wn.get_entry_id_for_sense(&member_sense.id) {
+        if let Some(entry_id) = wn.get_entry_id_for_sense(&member_sense.id)? {
             // Use the helper method to look up the entry
-            if let Some(entry) = wn.get_entry_by_id(entry_id) {
+            if let Some(entry) = wn.get_entry_by_id(&entry_id)? {
                 // Add the lemma if it's not the one currently being defined
                 if entry.lemma.written_form != current_lemma {
                     // Avoid duplicates
@@ -258,8 +258,7 @@ fn print_sense_details(
                     entry_id
                 );
             }
-        } else {
-        }
+        } // Error from get_entry_id_for_sense or get_entry_by_id is propagated by `?`
     }
     debug!(
         "Synonym lookup for synset {} took: {:?}",
@@ -293,7 +292,7 @@ fn print_sense_details(
 /// For SenseRelations, it checks relations across *all* senses within the synset.
 fn print_relation(
     wn: &WordNet,
-    synset: &Synset,
+    synset: &Synset, // Takes reference
     rel_type: impl Into<RelTypeMarker>,
     label: &str,
 ) -> Result<()> {
@@ -304,17 +303,17 @@ fn print_relation(
     match rel_type_marker {
         RelTypeMarker::Sense(sense_rel) => {
             // Iterate through ALL senses belonging to this synset
-            let member_senses = wn.get_senses_for_synset(&synset.id)?;
-            for member_sense in member_senses {
+            let member_senses = wn.get_senses_for_synset(&synset.id)?; // Returns Vec<Sense>
+            for member_sense in member_senses { // member_sense is Sense
                 // Get relations for *this specific member sense*
-                let related_target_senses = wn.get_related_senses(&member_sense.id, sense_rel)?;
-                for target_sense in related_target_senses {
+                let related_target_senses = wn.get_related_senses(&member_sense.id, sense_rel)?; // Returns Vec<Sense>
+                for target_sense in related_target_senses { // target_sense is Sense
                     // Important: Ensure the target sense is NOT part of the current synset
                     // (e.g., avoid listing members of the same synset as antonyms)
                     if target_sense.synset != synset.id {
                         // Find the entry for this target sense
-                        if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id) {
-                            if let Some(entry) = wn.get_entry_by_id(entry_id) {
+                        if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id)? { // Returns Result<Option<String>>
+                            if let Some(entry) = wn.get_entry_by_id(&entry_id)? { // Returns Result<Option<LexicalEntry>>
                                 if !related_lemmas.contains(&entry.lemma.written_form) {
                                     related_lemmas.push(entry.lemma.written_form.clone());
                                 }
@@ -325,17 +324,17 @@ fn print_relation(
             }
         }
         RelTypeMarker::Synset(synset_rel) => {
-            let related_synsets = wn.get_related_synsets(&synset.id, synset_rel)?;
-            for target_synset in related_synsets {
+            let related_synsets = wn.get_related_synsets(&synset.id, synset_rel)?; // Returns Vec<Synset>
+            for target_synset in related_synsets { // target_synset is Synset
                 // Get all lemmas associated with this target synset
-                let target_senses = wn.get_senses_for_synset(&target_synset.id)?;
-                for target_sense in target_senses {
-                    if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id) {
+                let target_senses = wn.get_senses_for_synset(&target_synset.id)?; // Returns Vec<Sense>
+                for target_sense in target_senses { // target_sense is Sense
+                    if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id)? { // Returns Result<Option<String>>
                         // Use helper method
-                        if let Some(entry) = wn.get_entry_by_id(entry_id) {
+                        if let Some(entry) = wn.get_entry_by_id(&entry_id)? { // Returns Result<Option<LexicalEntry>>
                             // Use helper method
                             if !related_lemmas.contains(&entry.lemma.written_form) {
-                                related_lemmas.push(entry.lemma.written_form.clone());
+                                related_lemmas.push(entry.lemma.written_form.clone()); // No change needed
                             }
                         }
                     }

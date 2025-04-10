@@ -44,4 +44,7 @@ pub enum OewnError {
 
     #[error("Internal error: {0}")]
     Internal(String), // For unexpected situations
+
+    #[error("Database error: {0}")]
+    DbError(#[from] rusqlite::Error),
 }
