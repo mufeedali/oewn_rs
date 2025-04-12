@@ -18,9 +18,6 @@ pub enum OewnError {
     #[error("XML parsing error: {0}")]
     XmlParse(#[from] quick_xml::DeError),
 
-    #[error("Cache serialization/deserialization error: {0}")]
-    CacheError(#[from] bincode::Error),
-
     #[error("Data directory not found or could not be determined")]
     DataDirNotFound,
 
