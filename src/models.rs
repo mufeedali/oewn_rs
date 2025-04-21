@@ -70,8 +70,6 @@ pub struct LexicalEntry {
     pub pronunciations: Vec<Pronunciation>,
     #[serde(rename = "Sense", default)]
     pub senses: Vec<Sense>,
-    #[serde(rename = "SyntacticBehaviour", default)]
-    pub syntactic_behaviours: Vec<SyntacticBehaviour>, // Behaviour defined directly within entry
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,8 +118,6 @@ pub struct Sense {
     pub id: String,
     #[serde(rename = "@synset")]
     pub synset: String, // Reference to Synset ID
-    #[serde(rename = "@subcat", default)]
-    pub subcat: Option<String>, // Reference to SyntacticBehaviour ID
     #[serde(rename = "SenseRelation", default)]
     pub sense_relations: Vec<SenseRelation>,
 }
@@ -150,14 +146,6 @@ pub enum SenseRelType {
     IsExemplifiedBy,
     #[serde(other)] // Catch-all for any other relation types found
     Other,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SyntacticBehaviour {
-    #[serde(rename = "@subcategorizationFrame")]
-    pub subcategorization_frame: String,
-    #[serde(rename = "@id", default)] // ID is optional if defined inline
-    pub id: Option<String>,
 }
 
 // --- Synset ---

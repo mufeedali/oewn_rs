@@ -1,7 +1,9 @@
 use crate::error::{OewnError, Result};
 use crate::models::{LexicalResource, PartOfSpeech, SenseRelType, SynsetRelType};
+use crate::progress::{ProgressCallback, ProgressUpdate};
 use log::{debug, info, warn};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // --- Schema Definition ---
@@ -67,10 +69,8 @@ CREATE TABLE IF NOT EXISTS senses (
     id TEXT PRIMARY KEY,
     entry_id TEXT NOT NULL,
     synset_id TEXT NOT NULL,
-    subcat TEXT, -- Reference to SyntacticBehaviour ID (if used)
     FOREIGN KEY (entry_id) REFERENCES lexical_entries(id),
     FOREIGN KEY (synset_id) REFERENCES synsets(id)
-    -- FOREIGN KEY (subcat) REFERENCES syntactic_behaviours(id) -- Add if behaviours are stored
 );";
 
 const CREATE_DEFINITIONS_TABLE: &str = "
@@ -159,7 +159,6 @@ pub fn initialize_database(conn: &mut Connection) -> Result<()> {
     tx.execute(CREATE_EXAMPLES_TABLE, [])?;
     tx.execute(CREATE_SENSE_RELATIONS_TABLE, [])?;
     tx.execute(CREATE_SYNSET_RELATIONS_TABLE, [])?;
-    // tx.execute(CREATE_SYNTACTIC_BEHAVIOURS_TABLE, [])?; // Uncomment if needed
 
     // Create indices
     tx.execute(CREATE_ENTRY_LEMMA_LOWER_INDEX, [])?;
@@ -185,33 +184,36 @@ pub fn initialize_database(conn: &mut Connection) -> Result<()> {
     match existing_version_str {
         Some(v_str) => {
             let existing_version: u32 = v_str.parse().map_err(|e| {
-                // Use ParseError for parsing issues
                 OewnError::ParseError(format!(
                     "Failed to parse existing schema version '{}': {}",
                     v_str, e
                 ))
             })?;
-            if existing_version < SCHEMA_VERSION {
-                warn!(
-                    "Database schema version ({}) is older than expected ({}). Migration needed.",
-                    existing_version, SCHEMA_VERSION
-                );
-                // For now, just update the version
-                tx.execute(
-                    "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
-                    params![SCHEMA_VERSION.to_string()],
-                )?;
-                info!("Updated schema version in metadata table.");
-            } else if existing_version > SCHEMA_VERSION {
-                warn!(
-                    "Database schema version ({}) is newer than expected ({}). Using potentially incompatible schema.",
-                    existing_version, SCHEMA_VERSION
-                );
-            } else {
-                debug!(
-                    "Database schema version ({}) matches expected version.",
-                    existing_version
-                );
+            match existing_version.cmp(&SCHEMA_VERSION) {
+                std::cmp::Ordering::Less => {
+                    warn!(
+                        "Database schema version ({}) is older than expected ({}). Migration needed.",
+                        existing_version, SCHEMA_VERSION
+                    );
+                    // For now, just update the version
+                    tx.execute(
+                        "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
+                        params![SCHEMA_VERSION.to_string()],
+                    )?;
+                    info!("Updated schema version in metadata table.");
+                }
+                std::cmp::Ordering::Greater => {
+                    warn!(
+                        "Database schema version ({}) is newer than expected ({}). Using potentially incompatible schema.",
+                        existing_version, SCHEMA_VERSION
+                    );
+                }
+                std::cmp::Ordering::Equal => {
+                    debug!(
+                        "Database schema version ({}) matches expected version.",
+                        existing_version
+                    );
+                }
             }
         }
         None => {
@@ -234,9 +236,37 @@ pub fn initialize_database(conn: &mut Connection) -> Result<()> {
 /// Populates the database tables from a parsed LexicalResource.
 /// Assumes the database is empty or should be overwritten.
 /// Uses a transaction and prepared statements for efficiency.
-pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Result<()> {
+pub fn populate_database(
+    conn: &mut Connection,
+    resource: LexicalResource,
+    reporter: Arc<Mutex<Option<ProgressCallback>>>,
+) -> Result<()> {
     info!("Populating database from parsed LexicalResource using prepared statements...");
     let start_time = Instant::now();
+
+    // --- Calculate Totals for Progress Reporting ---
+    let total_lexicons = resource.lexicons.len() as u64;
+    let total_entries = resource.lexicons.iter().map(|l| l.lexical_entries.len()).sum::<usize>() as u64;
+    let total_synsets = resource.lexicons.iter().map(|l| l.synsets.len()).sum::<usize>() as u64;
+    let total_pronunciations = resource.lexicons.iter().flat_map(|l| &l.lexical_entries).map(|e| e.pronunciations.len()).sum::<usize>() as u64;
+    let total_senses = resource.lexicons.iter().flat_map(|l| &l.lexical_entries).map(|e| e.senses.len()).sum::<usize>() as u64;
+    let total_definitions = resource.lexicons.iter().flat_map(|l| &l.synsets).map(|s| s.definitions.len()).sum::<usize>() as u64;
+    let total_ili_definitions = resource.lexicons.iter().flat_map(|l| &l.synsets).filter(|s| s.ili_definition.is_some()).count() as u64;
+    let total_examples = resource.lexicons.iter().flat_map(|l| &l.synsets).map(|s| s.examples.len()).sum::<usize>() as u64;
+    let total_sense_relations = resource.lexicons.iter().flat_map(|l| &l.lexical_entries).flat_map(|e| &e.senses).map(|s| s.sense_relations.len()).sum::<usize>() as u64;
+    let total_synset_relations = resource.lexicons.iter().flat_map(|l| &l.synsets).map(|s| s.synset_relations.len()).sum::<usize>() as u64;
+
+    let pass1_total = total_lexicons + total_entries + total_synsets;
+    let pass2_total = total_pronunciations + total_senses + total_definitions + total_ili_definitions + total_examples;
+    let pass3_total = total_sense_relations + total_synset_relations;
+
+    // Helper closure to invoke the callback inside the Arc<Mutex<>>
+    let maybe_report = |update: ProgressUpdate| {
+        if let Some(cb) = reporter.lock().unwrap().as_mut() {
+            let _ = cb(update); // Ignore return value for now
+        }
+    };
+
 
     let tx = conn.transaction()?;
 
@@ -258,8 +288,8 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     let mut sense_stmt = tx.prepare(
-        "INSERT INTO senses (id, entry_id, synset_id, subcat)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO senses (id, entry_id, synset_id)
+         VALUES (?1, ?2, ?3)",
     )?;
     let mut def_stmt = tx.prepare(
         "INSERT INTO definitions (synset_id, text, dc_source)
@@ -284,6 +314,12 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
 
     // --- Pass 1: Insert core entities (Lexicons, Entries, Synsets) ---
     info!("Population Pass 1: Inserting Lexicons, LexicalEntries, Synsets...");
+    maybe_report(ProgressUpdate::new_stage(
+        "Pass 1/3: Inserting Core Entities".to_string(),
+        Some(pass1_total),
+    ));
+    let mut pass1_current = 0;
+
     for lexicon in &resource.lexicons {
         debug!("Pass 1: Inserting lexicon: {}", lexicon.id);
         lexicon_stmt.execute(params![
@@ -301,6 +337,14 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
             lexicon.dc_publisher,
             lexicon.dc_contributor,
         ])?;
+        pass1_current += 1;
+        maybe_report(ProgressUpdate {
+            stage_description: "Pass 1/3: Inserting Core Entities".to_string(),
+            current_item: pass1_current,
+            total_items: Some(pass1_total),
+            message: Some(format!("Lexicon: {}", lexicon.id)),
+        });
+
 
         for entry in &lexicon.lexical_entries {
             entry_stmt.execute(params![
@@ -310,6 +354,13 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
                 entry.lemma.written_form.to_lowercase(), // Store lowercase version
                 part_of_speech_to_string(entry.lemma.part_of_speech), // Store POS as string
             ])?;
+            pass1_current += 1;
+            maybe_report(ProgressUpdate {
+                stage_description: "Pass 1/3: Inserting Core Entities".to_string(),
+                current_item: pass1_current,
+                total_items: Some(pass1_total),
+                message: Some(format!("Entry: {}", entry.id)),
+            });
         }
 
         for synset in &lexicon.synsets {
@@ -319,12 +370,25 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
                 synset.ili,
                 part_of_speech_to_string(synset.part_of_speech), // Store POS as string
             ])?;
+            pass1_current += 1;
+             maybe_report(ProgressUpdate {
+                stage_description: "Pass 1/3: Inserting Core Entities".to_string(),
+                current_item: pass1_current,
+                total_items: Some(pass1_total),
+                message: Some(format!("Synset: {}", synset.id)),
+            });
         }
     }
     info!("Pass 1 complete.");
 
     // --- Pass 2: Insert entities referencing core entities (Senses, Definitions, Examples, Pronunciations) ---
     info!("Population Pass 2: Inserting Senses, Definitions, Examples, Pronunciations...");
+    maybe_report(ProgressUpdate::new_stage(
+        "Pass 2/3: Inserting Details".to_string(),
+        Some(pass2_total),
+    ));
+    let mut pass2_current = 0;
+
     for lexicon in &resource.lexicons {
         for entry in &lexicon.lexical_entries {
             for pron in &entry.pronunciations {
@@ -336,15 +400,28 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
                     pron.audio,
                     pron.text,
                 ])?;
+                pass2_current += 1;
+                maybe_report(ProgressUpdate {
+                    stage_description: "Pass 2/3: Inserting Details".to_string(),
+                    current_item: pass2_current,
+                    total_items: Some(pass2_total),
+                    message: Some(format!("Pronunciation for Entry: {}", entry.id)),
+                });
             }
 
             for sense in &entry.senses {
                 sense_stmt.execute(params![
                     sense.id,
-                    entry.id,     // Foreign key
+                    entry.id, // Foreign key
                     sense.synset, // Foreign key (references synset.id)
-                    sense.subcat,
                 ])?;
+                pass2_current += 1;
+                 maybe_report(ProgressUpdate {
+                    stage_description: "Pass 2/3: Inserting Details".to_string(),
+                    current_item: pass2_current,
+                    total_items: Some(pass2_total),
+                    message: Some(format!("Sense: {}", sense.id)),
+                });
             }
         }
 
@@ -355,6 +432,13 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
                     definition.text,
                     definition.dc_source,
                 ])?;
+                pass2_current += 1;
+                 maybe_report(ProgressUpdate {
+                    stage_description: "Pass 2/3: Inserting Details".to_string(),
+                    current_item: pass2_current,
+                    total_items: Some(pass2_total),
+                    message: Some(format!("Definition for Synset: {}", synset.id)),
+                });
             }
 
             if let Some(ili_def) = &synset.ili_definition {
@@ -363,6 +447,13 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
                     ili_def.text,
                     ili_def.dc_source,
                 ])?;
+                pass2_current += 1;
+                 maybe_report(ProgressUpdate {
+                    stage_description: "Pass 2/3: Inserting Details".to_string(),
+                    current_item: pass2_current,
+                    total_items: Some(pass2_total),
+                    message: Some(format!("ILI Definition for Synset: {}", synset.id)),
+                });
             }
 
             for example in &synset.examples {
@@ -371,6 +462,13 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
                     example.text,
                     example.dc_source,
                 ])?;
+                pass2_current += 1;
+                 maybe_report(ProgressUpdate {
+                    stage_description: "Pass 2/3: Inserting Details".to_string(),
+                    current_item: pass2_current,
+                    total_items: Some(pass2_total),
+                    message: Some(format!("Example for Synset: {}", synset.id)),
+                });
             }
         }
     }
@@ -378,6 +476,12 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
 
     // --- Pass 3: Insert relations (SenseRelations, SynsetRelations) ---
     info!("Population Pass 3: Inserting SenseRelations, SynsetRelations...");
+    maybe_report(ProgressUpdate::new_stage(
+        "Pass 3/3: Inserting Relations".to_string(),
+        Some(pass3_total),
+    ));
+    let mut pass3_current = 0;
+
     for lexicon in &resource.lexicons {
         for entry in &lexicon.lexical_entries {
             for sense in &entry.senses {
@@ -387,6 +491,13 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
                         relation.target,                             // Target sense ID
                         sense_rel_type_to_string(relation.rel_type), // Store type as string
                     ])?;
+                    pass3_current += 1;
+                    maybe_report(ProgressUpdate {
+                        stage_description: "Pass 3/3: Inserting Relations".to_string(),
+                        current_item: pass3_current,
+                        total_items: Some(pass3_total),
+                        message: Some(format!("Sense Relation from: {}", sense.id)),
+                    });
                 }
             }
         }
@@ -397,6 +508,13 @@ pub fn populate_database(conn: &mut Connection, resource: LexicalResource) -> Re
                     relation.target,                              // Target synset ID
                     synset_rel_type_to_string(relation.rel_type), // Store type as string
                 ])?;
+                pass3_current += 1;
+                 maybe_report(ProgressUpdate {
+                    stage_description: "Pass 3/3: Inserting Relations".to_string(),
+                    current_item: pass3_current,
+                    total_items: Some(pass3_total),
+                    message: Some(format!("Synset Relation from: {}", synset.id)),
+                });
             }
         }
     }
@@ -433,7 +551,6 @@ pub fn clear_database_data(tx: &Transaction) -> Result<()> {
     tx.execute("DELETE FROM ili_definitions", [])?;
     tx.execute("DELETE FROM examples", [])?;
     tx.execute("DELETE FROM pronunciations", [])?;
-    // tx.execute("DELETE FROM syntactic_behaviours", [])?; // If used
     tx.execute("DELETE FROM senses", [])?;
     tx.execute("DELETE FROM synsets", [])?;
     tx.execute("DELETE FROM lexical_entries", [])?;
@@ -470,7 +587,6 @@ pub fn string_to_part_of_speech(s: &str) -> Result<PartOfSpeech> {
         "p" => Ok(PartOfSpeech::P),
         "x" => Ok(PartOfSpeech::X),
         "u" => Ok(PartOfSpeech::U),
-        // Use ParseError for invalid string values from DB
         _ => Err(OewnError::ParseError(format!(
             "Invalid PartOfSpeech string in DB: {}",
             s

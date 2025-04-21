@@ -4,14 +4,28 @@ pub mod db;
 pub mod error;
 pub mod models;
 pub mod parse;
+pub mod progress;
 
 // Re-export key types for easier use
 pub use error::{OewnError, Result};
 pub use models::{
-    Definition, Example, ILIDefinition, Lemma, LexicalEntry, LexicalResource, Lexicon,
-    PartOfSpeech, Pronunciation, Sense, SenseRelType, SenseRelation, Synset, SynsetRelType,
-    SynsetRelation, SyntacticBehaviour,
+    Definition,
+    Example,
+    ILIDefinition,
+    Lemma,
+    LexicalEntry,
+    LexicalResource,
+    Lexicon,
+    PartOfSpeech,
+    Pronunciation,
+    Sense,
+    SenseRelType,
+    SenseRelation,
+    Synset,
+    SynsetRelType,
+    SynsetRelation,
 };
+use crate::progress::{ProgressCallback, ProgressUpdate};
 
 use crate::db::{string_to_part_of_speech, string_to_sense_rel_type, string_to_synset_rel_type};
 use directories_next::ProjectDirs;
@@ -19,7 +33,7 @@ use log::{debug, error, info, warn};
 use parse::parse_lmf;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params}; // Import rusqlite types
 use std::fs;
-use std::path::{Path, PathBuf}; // Keep PathBuf
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex}; // Use Mutex for interior mutability of Connection
 
 // --- Constants ---
@@ -43,13 +57,7 @@ pub struct LoadOptions {
 #[derive(Clone)] // Clone is cheap due to Arc<Mutex<...>>
 pub struct WordNet {
     // Use Arc<Mutex<>> for thread-safe access to the connection if WordNet needs to be Send + Sync
-    // If only used in single-threaded async context, Arc<Connection> might suffice,
-    // but Mutex is safer for broader usability.
-    // Consider a connection pool (like r2d2) for high-concurrency scenarios.
     conn: Arc<Mutex<Connection>>,
-    // Keep the path to the database file for reference or potential future operations
-    #[allow(dead_code)] // Allow dead code for now, might be used later
-    db_file_path: Arc<PathBuf>,
 }
 
 // Helper function to open/create the database connection
@@ -79,16 +87,29 @@ fn open_db_connection(path: &Path) -> Result<Connection> {
 }
 
 impl WordNet {
-    /// Loads the WordNet data using default options (automatic database path).
+    /// Loads the WordNet data using default options (automatic database path) and no progress reporting.
     ///
     /// Ensures data is downloaded/extracted if needed.
     /// Opens/creates the database, initializes schema, and populates from XML if necessary.
     pub async fn load() -> Result<Self> {
-        Self::load_with_options(LoadOptions::default()).await
+        Self::load_with_options(LoadOptions::default(), None).await // Pass None for callback
     }
 
-    /// Loads the WordNet data with specific options.
-    pub async fn load_with_options(options: LoadOptions) -> Result<Self> {
+    /// Loads the WordNet data with specific options and an optional progress callback.
+    pub async fn load_with_options(
+        options: LoadOptions,
+        progress_callback: Option<ProgressCallback>, // Keep original parameter type
+    ) -> Result<Self> {
+        // Wrap the callback in Arc<Mutex<Option<...>>> for safe sharing across async/sync boundaries
+        let reporter = Arc::new(Mutex::new(progress_callback));
+
+        // Helper closure to simplify reporting
+        let report = |update: ProgressUpdate| {
+            if let Some(cb) = reporter.lock().unwrap().as_mut() {
+                let _ = cb(update); // Ignore return value for now
+            }
+        };
+
         // 1. Determine database file path
         let db_path = match options.db_path {
             Some(path) => {
@@ -139,25 +160,44 @@ impl WordNet {
                 info!("Database needs population (first run or empty).");
             }
 
-            // Ensure raw XML data file is present
-            let xml_path = data::ensure_data().await?;
+            // Ensure raw XML data file is present, passing the reporter Arc
+            let xml_path = data::ensure_data(reporter.clone()).await?; // Pass Arc clone
             info!("OEWN XML data available at: {:?}", xml_path);
 
-            // Parse raw XML data
-            info!("Reading and parsing XML file: {:?}", xml_path);
+            // --- Read XML File ---
+            let read_stage = "Reading XML file".to_string();
+            info!("Reading XML file: {:?}", xml_path);
+            report(ProgressUpdate::new_stage(read_stage.clone(), None)); // Indeterminate start
             let xml_content = tokio::fs::read_to_string(&xml_path).await?;
-            let resource = parse_lmf(&xml_content).await?; // parse_lmf remains synchronous internally
+            report(ProgressUpdate { // Indicate completion
+                stage_description: read_stage,
+                current_item: 1,
+                total_items: Some(1),
+                message: Some("Read complete.".to_string()),
+            });
 
-            // Populate the database tables
-            // populate_database handles its own transaction
-            db::populate_database(&mut conn, resource)?;
+            // --- Parse XML Data ---
+            let parse_stage = "Parsing XML data".to_string();
+            info!("Parsing XML data...");
+            report(ProgressUpdate::new_stage(parse_stage.clone(), None)); // Indeterminate start
+            let resource = parse_lmf(xml_content).await?; // Pass owned String
+            report(ProgressUpdate { // Indicate completion
+                stage_description: parse_stage,
+                current_item: 1,
+                total_items: Some(1),
+                message: Some("Parsing complete.".to_string()),
+            });
+
+            // --- Populate Database ---
+            // populate_database handles its own transaction and progress reporting internally
+            // Pass the reporter Arc clone.
+            db::populate_database(&mut conn, resource, reporter.clone())?; // Pass Arc clone
         } else {
             info!("Using existing populated database: {:?}", db_path);
         }
 
         Ok(WordNet {
             conn: Arc::new(Mutex::new(conn)), // Wrap connection in Arc<Mutex>
-            db_file_path: Arc::new(db_path),
         })
     }
 
@@ -259,7 +299,7 @@ impl WordNet {
             SELECT
                 le.id AS entry_id, le.lemma_written_form, le.part_of_speech,
                 p.variety, p.notation, p.phonemic, p.audio, p.text AS pron_text,
-                s.id AS sense_id, s.synset_id, s.subcat,
+                s.id AS sense_id, s.synset_id,
                 sr.target_sense_id AS sense_rel_target, sr.rel_type AS sense_rel_type
             FROM lexical_entries le
             LEFT JOIN pronunciations p ON le.id = p.entry_id
@@ -310,7 +350,6 @@ impl WordNet {
                         },
                         pronunciations: Vec::new(),
                         senses: Vec::new(),
-                        syntactic_behaviours: Vec::new(),
                     });
 
             // --- Extract and Store Pronunciation ---
@@ -343,7 +382,6 @@ impl WordNet {
             let sense_id_opt: Option<String> = row.get("sense_id")?;
             if let Some(sense_id) = sense_id_opt {
                 let synset_id: String = row.get("synset_id")?; // Should exist if sense_id exists
-                let subcat: Option<String> = row.get("subcat")?;
                 let sense_rel_target: Option<String> = row.get("sense_rel_target")?;
                 let sense_rel_type_str: Option<String> = row.get("sense_rel_type")?;
 
@@ -354,7 +392,6 @@ impl WordNet {
                     .or_insert_with(|| Sense {
                         id: sense_id.clone(),
                         synset: synset_id,
-                        subcat,
                         sense_relations: Vec::new(),
                     });
 
@@ -362,10 +399,10 @@ impl WordNet {
                 if let (Some(target), Some(rel_str)) = (sense_rel_target, sense_rel_type_str) {
                     let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            12,
+                            11,
                             rusqlite::types::Type::Text,
                             Box::new(e),
-                        ) // Adjust index if needed
+                        )
                     })?;
                     let new_relation = SenseRelation { target, rel_type };
                     if !sense_entry.sense_relations.contains(&new_relation) {
@@ -448,7 +485,7 @@ impl WordNet {
 
         let sql = "
             SELECT
-                s.id, s.synset_id, s.subcat,
+                s.id, s.synset_id,
                 sr.target_sense_id, sr.rel_type
             FROM senses s
             LEFT JOIN sense_relations sr ON s.id = sr.source_sense_id
@@ -465,15 +502,13 @@ impl WordNet {
             // Extract data from the row
             let sense_id: String = row.get(0)?;
             let current_synset_id: String = row.get(1)?; // Should match input synset_id
-            let subcat: Option<String> = row.get(2)?;
-            let target_sense_id: Option<String> = row.get(3)?;
-            let rel_type_str: Option<String> = row.get(4)?;
+            let target_sense_id: Option<String> = row.get(2)?;
+            let rel_type_str: Option<String> = row.get(3)?;
 
             // Create or get the Sense struct from the map
             let sense_entry = senses_map.entry(sense_id.clone()).or_insert_with(|| Sense {
                 id: sense_id.clone(),
                 synset: current_synset_id, // Use the value from the row
-                subcat,
                 sense_relations: Vec::new(), // Initialize relations vector
             });
 
@@ -481,7 +516,7 @@ impl WordNet {
             if let (Some(target), Some(rel_str)) = (target_sense_id, rel_type_str) {
                 let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        4,
+                        3,
                         rusqlite::types::Type::Text,
                         Box::new(e),
                     )
@@ -547,7 +582,7 @@ impl WordNet {
             SELECT
                 le.id AS entry_id, le.lemma_written_form, le.part_of_speech,
                 p.variety, p.notation, p.phonemic, p.audio, p.text AS pron_text,
-                s.id AS sense_id, s.synset_id, s.subcat,
+                s.id AS sense_id, s.synset_id,
                 sr.target_sense_id AS sense_rel_target, sr.rel_type AS sense_rel_type
             FROM lexical_entries le
             LEFT JOIN pronunciations p ON le.id = p.entry_id
@@ -598,7 +633,6 @@ impl WordNet {
                         },
                         pronunciations: Vec::new(),
                         senses: Vec::new(),
-                        syntactic_behaviours: Vec::new(),
                     });
 
             // --- Extract and Store Pronunciation ---
@@ -631,7 +665,6 @@ impl WordNet {
             let sense_id_opt: Option<String> = row.get("sense_id")?;
             if let Some(sense_id) = sense_id_opt {
                 let synset_id: String = row.get("synset_id")?; // Should exist if sense_id exists
-                let subcat: Option<String> = row.get("subcat")?;
                 let sense_rel_target: Option<String> = row.get("sense_rel_target")?;
                 let sense_rel_type_str: Option<String> = row.get("sense_rel_type")?;
 
@@ -642,7 +675,6 @@ impl WordNet {
                     .or_insert_with(|| Sense {
                         id: sense_id.clone(),
                         synset: synset_id,
-                        subcat,
                         sense_relations: Vec::new(),
                     });
 
@@ -650,10 +682,10 @@ impl WordNet {
                 if let (Some(target), Some(rel_str)) = (sense_rel_target, sense_rel_type_str) {
                     let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            12,
+                            11,
                             rusqlite::types::Type::Text,
                             Box::new(e),
-                        ) // Adjust index if needed
+                        )
                     })?;
                     let new_relation = SenseRelation { target, rel_type };
                     if !sense_entry.sense_relations.contains(&new_relation) {
@@ -750,9 +782,8 @@ impl WordNet {
                 entry_opt = Some(LexicalEntry {
                     id: id.clone(),
                     lemma,
-                    pronunciations: Vec::new(),       // Initialize
-                    senses: Vec::new(),               // Initialize
-                    syntactic_behaviours: Vec::new(), // TODO: Fetch if needed
+                    pronunciations: Vec::new(), // Initialize
+                    senses: Vec::new(),         // Initialize
                 });
             }
 
@@ -804,7 +835,7 @@ impl WordNet {
     ) -> Result<Vec<Sense>> {
         let sql = "
             SELECT
-                s.id, s.synset_id, s.subcat,
+                s.id, s.synset_id,
                 sr.target_sense_id, sr.rel_type
             FROM senses s
             LEFT JOIN sense_relations sr ON s.id = sr.source_sense_id
@@ -821,15 +852,13 @@ impl WordNet {
             // Extract data from the row
             let sense_id: String = row.get(0)?;
             let synset_id: String = row.get(1)?;
-            let subcat: Option<String> = row.get(2)?;
-            let target_sense_id: Option<String> = row.get(3)?;
-            let rel_type_str: Option<String> = row.get(4)?;
+            let target_sense_id: Option<String> = row.get(2)?;
+            let rel_type_str: Option<String> = row.get(3)?;
 
             // Create or get the Sense struct from the map
             let sense_entry = senses_map.entry(sense_id.clone()).or_insert_with(|| Sense {
                 id: sense_id.clone(),
                 synset: synset_id,
-                subcat,
                 sense_relations: Vec::new(), // Initialize relations vector
             });
 
@@ -837,7 +866,7 @@ impl WordNet {
             if let (Some(target), Some(rel_str)) = (target_sense_id, rel_type_str) {
                 let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        4,
+                        3,
                         rusqlite::types::Type::Text,
                         Box::new(e),
                     )
@@ -875,7 +904,7 @@ impl WordNet {
         // then LEFT JOINs sense_relations (sr_target) again to get relations *of the target sense*.
         let sql = "
             SELECT
-                s_target.id, s_target.synset_id, s_target.subcat,
+                s_target.id, s_target.synset_id,
                 sr_target.target_sense_id AS target_rel_target_id,
                 sr_target.rel_type AS target_rel_type
             FROM sense_relations sr1
@@ -893,9 +922,8 @@ impl WordNet {
             // Extract target sense data
             let target_sense_id: String = row.get(0)?;
             let target_synset_id: String = row.get(1)?;
-            let target_subcat: Option<String> = row.get(2)?;
-            let target_rel_target_id: Option<String> = row.get(3)?;
-            let target_rel_type_str: Option<String> = row.get(4)?;
+            let target_rel_target_id: Option<String> = row.get(2)?;
+            let target_rel_type_str: Option<String> = row.get(3)?;
 
             // Create or get the target Sense struct
             let sense_entry = senses_map
@@ -903,7 +931,6 @@ impl WordNet {
                 .or_insert_with(|| Sense {
                     id: target_sense_id.clone(),
                     synset: target_synset_id,
-                    subcat: target_subcat,
                     sense_relations: Vec::new(),
                 });
 
@@ -913,7 +940,7 @@ impl WordNet {
             {
                 let rel_type = string_to_sense_rel_type(&target_rel_str).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        4,
+                        3,
                         rusqlite::types::Type::Text,
                         Box::new(e),
                     )
@@ -942,7 +969,7 @@ impl WordNet {
     fn fetch_full_sense_by_id(&self, conn: &Connection, sense_id: &str) -> Result<Option<Sense>> {
         let sql = "
             SELECT
-                s.id, s.synset_id, s.subcat,
+                s.id, s.synset_id,
                 sr.target_sense_id, sr.rel_type
             FROM senses s
             LEFT JOIN sense_relations sr ON s.id = sr.source_sense_id
@@ -957,16 +984,14 @@ impl WordNet {
             // Extract data from the row
             let current_sense_id: String = row.get(0)?; // Should always be the same as input sense_id
             let synset_id: String = row.get(1)?;
-            let subcat: Option<String> = row.get(2)?;
-            let target_sense_id: Option<String> = row.get(3)?;
-            let rel_type_str: Option<String> = row.get(4)?;
+            let target_sense_id: Option<String> = row.get(2)?;
+            let rel_type_str: Option<String> = row.get(3)?;
 
             // Initialize the Sense struct on the first row
             if sense_opt.is_none() {
                 sense_opt = Some(Sense {
                     id: current_sense_id.clone(),
                     synset: synset_id,
-                    subcat,
                     sense_relations: Vec::new(), // Initialize relations vector
                 });
             }
@@ -975,7 +1000,7 @@ impl WordNet {
             if let (Some(target), Some(rel_str)) = (target_sense_id, rel_type_str) {
                 let rel_type = string_to_sense_rel_type(&rel_str).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        4,
+                        3,
                         rusqlite::types::Type::Text,
                         Box::new(e),
                     )
@@ -1322,7 +1347,7 @@ mod tests {
         let db_path = temp_dir.path().join("test_load.db");
 
         // Create dummy XML data (or use a small test fixture)
-        let dummy_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        let _dummy_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
             <LexicalResource>
               <Lexicon id="test-en" label="Test" language="en" email="a@b.c" license="l" version="1">
                 <LexicalEntry id="w1">
@@ -1340,7 +1365,7 @@ mod tests {
         // or refactor ensure_data for testability.
 
         // Test loading (this will likely fail until ensure_data is handled and methods implemented)
-        let load_options = LoadOptions {
+        let _load_options = LoadOptions {
             db_path: Some(db_path.clone()),
             force_reload: true, // Force population for the test
         };

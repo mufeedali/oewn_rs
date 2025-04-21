@@ -16,7 +16,7 @@ pub enum OewnError {
     Zip(#[from] zip::result::ZipError),
 
     #[error("XML parsing error: {0}")]
-    XmlParse(#[from] quick_xml::DeError),
+    XmlParse(quick_xml::DeError),
 
     #[error("Data directory not found or could not be determined")]
     DataDirNotFound,
@@ -44,4 +44,14 @@ pub enum OewnError {
 
     #[error("Database error: {0}")]
     DbError(#[from] rusqlite::Error),
+
+    #[error("Tokio join error: {0}")]
+    JoinError(#[from] tokio::task::JoinError),
+}
+
+// Implement From<quick_xml::DeError> manually
+impl From<quick_xml::DeError> for OewnError {
+    fn from(err: quick_xml::DeError) -> Self {
+        OewnError::XmlParse(err)
+    }
 }

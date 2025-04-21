@@ -1,13 +1,16 @@
 use clap::{Parser, Subcommand};
 use colored::*;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{LevelFilter, debug, error, info, warn};
 use oewn_rs::{
     LexicalEntry, LoadOptions, SenseRelType, Synset, SynsetRelType, WordNet, error::Result,
-    models::PartOfSpeech,
+    models::PartOfSpeech, progress::{ProgressCallback, ProgressUpdate},
 };
 use std::collections::HashMap;
 use std::io::Write;
-use std::time::Instant;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // --- CLI Argument Parsing ---
 
@@ -18,15 +21,15 @@ struct Cli {
     command: Commands,
 
     /// Path to a custom database file (optional)
-    #[arg(long)]
+    #[arg(long, global = true)]
     db_path: Option<String>,
 
     /// Force reload data, ignoring existing database content
-    #[arg(long, default_value_t = false)]
+    #[arg(long, global = true, default_value_t = false)]
     force_reload: bool,
 
     /// Set verbosity level (e.g., -v, -vv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 }
 
@@ -37,7 +40,7 @@ enum Commands {
         /// The word to define
         word: String,
         /// Optional part of speech filter (noun, verb, adj, adv)
-        pos: Option<PartOfSpeech>, // Use the FromStr impl in models.rs
+        pos: Option<PartOfSpeech>,
     },
     /// Show a random word
     Random,
@@ -66,24 +69,93 @@ async fn main() -> Result<()> {
         })
         .init();
 
-    // --- Load WordNet Data ---
+    // --- Load WordNet Data with Progress ---
     info!("Loading WordNet data...");
+
+    // Setup Indicatif progress bars
+    let multi_progress = MultiProgress::new();
+    let progress_bars = Arc::new(Mutex::new(HashMap::<String, ProgressBar>::new())); // Store bars by stage name
+
+    // Define the progress callback
+    let mp_clone = multi_progress.clone(); // Clone for use in the callback
+    let pb_map_clone = progress_bars.clone();
+    let callback: ProgressCallback = Box::new(move |update: ProgressUpdate| {
+        let mut bars = pb_map_clone.lock().unwrap(); // Lock the map
+
+        // Check if it's a new stage or an update
+        if update.current_item == 0 {
+            // New stage or start of existing stage
+            let pb = mp_clone.add(ProgressBar::new(update.total_items.unwrap_or(0)));
+            let style_template = if update.total_items.is_some() {
+                // Template with percentage, bar, count, message
+                "{prefix:>12.cyan.bold} [{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} ({percent}%) {msg}"
+            } else {
+                // Template for spinners or unknown length
+                "{prefix:>12.cyan.bold} [{elapsed_precise}] {spinner} {msg}"
+            };
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(style_template)
+                    .unwrap()
+                    .progress_chars("##-"),
+            );
+            pb.set_prefix(update.stage_description.clone());
+            pb.set_message(update.message.unwrap_or_default());
+            pb.enable_steady_tick(Duration::from_millis(100)); // Update interval
+            bars.insert(update.stage_description, pb); // Store the new bar
+        } else if let Some(pb) = bars.get(&update.stage_description) {
+            // Update existing stage
+            pb.set_position(update.current_item);
+            if let Some(msg) = update.message {
+                 pb.set_message(msg); // Update message if provided
+            }
+            // Finish the bar if it reaches the total
+            if let Some(total) = update.total_items {
+                if update.current_item >= total {
+                    pb.finish_with_message("Done");
+                }
+            }
+        }
+        // In the future, return false here to signal cancellation request
+        true
+    });
+
+
     let load_options = LoadOptions {
-        db_path: cli.db_path.as_ref().map(PathBuf::from), // Use db_path
+        db_path: cli.db_path.as_ref().map(PathBuf::from),
         force_reload: cli.force_reload,
     };
-    let wn = match WordNet::load_with_options(load_options).await {
+
+    // Spawn the loading operation into a separate task
+    let load_handle = tokio::spawn(async move {
+        WordNet::load_with_options(load_options, Some(callback)).await // Pass the callback
+    });
+
+    // Await the result of the loading task
+    let wn_result = load_handle.await.unwrap_or_else(|e| {
+        eprintln!("Error awaiting loading task: {}", e);
+        std::process::exit(1); // Exit if the spawned task itself failed
+    });
+
+    // Ensure all progress bars are finished and clear them
+    // This is important for a clean exit
+    multi_progress.clear().unwrap_or_else(|e| eprintln!("Error clearing progress bars: {}", e));
+
+
+    let wn = match wn_result {
         Ok(wn) => {
             info!("WordNet data loaded successfully.");
+            // No need to print success here if progress bars show completion
             wn
         }
         Err(e) => {
             error!("Failed to load WordNet data: {}", e);
-            // Print a user-friendly error message
-            eprintln!("{}", format!("Error loading WordNet: {}", e).red());
+            // Error message is already printed by the logger
+            eprintln!("{}", format!("Error: {}", e).red()); // Simple error for user
             std::process::exit(1);
         }
     };
+
 
     // --- Execute Command ---
     match cli.command {
@@ -108,7 +180,7 @@ async fn main() -> Result<()> {
                 Some(PathBuf::from(custom_path))
             } else {
                 // Try to get default path, ignore error if it fails (e.g., dir not found yet)
-                WordNet::get_default_db_path().ok() // Use get_default_db_path
+                WordNet::get_default_db_path().ok()
             };
 
             match WordNet::clear_database(db_path_to_clear) {
@@ -331,10 +403,8 @@ fn print_relation(
                     // target_sense is Sense
                     if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id)? {
                         // Returns Result<Option<String>>
-                        // Use helper method
                         if let Some(entry) = wn.get_entry_by_id(&entry_id)? {
                             // Returns Result<Option<LexicalEntry>>
-                            // Use helper method
                             if !related_lemmas.contains(&entry.lemma.written_form) {
                                 related_lemmas.push(entry.lemma.written_form.clone());
                             }
@@ -400,5 +470,3 @@ async fn handle_random(wn: &WordNet) -> Result<()> {
     }
     Ok(())
 }
-
-use std::path::PathBuf;

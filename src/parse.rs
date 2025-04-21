@@ -1,13 +1,17 @@
-use crate::error::Result;
+use crate::error::{OewnError, Result};
 use crate::models::LexicalResource;
 use log::debug;
 use quick_xml::de::from_str;
+use tokio::task;
 
-/// Parses WN-LMF XML content into a LexicalResource struct.
-pub async fn parse_lmf(xml_content: &str) -> Result<LexicalResource> {
-    debug!("Starting WN-LMF XML parsing...");
-    // Note: quick-xml's from_str is synchronous.
-    let resource: LexicalResource = from_str(xml_content)?;
+/// Parses WN-LMF XML content into a LexicalResource struct using spawn_blocking.
+pub async fn parse_lmf(xml_content: String) -> Result<LexicalResource> {
+    debug!("Starting WN-LMF XML parsing (using spawn_blocking)...");
+    // Wrap the synchronous parsing in spawn_blocking
+    let resource = task::spawn_blocking(move || -> Result<LexicalResource> {
+        from_str(&xml_content).map_err(OewnError::from) // Map quick_xml::DeError to OewnError
+    })
+    .await??;
     debug!("Successfully parsed WN-LMF XML into LexicalResource.");
     Ok(resource)
 }
@@ -39,7 +43,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_minimal_lmf() {
-        let result = parse_lmf(MINIMAL_LMF_XML).await;
+        let result = parse_lmf(MINIMAL_LMF_XML.to_string()).await;
         assert!(result.is_ok(), "Parsing failed: {:?}", result.err());
         let resource = result.unwrap();
         assert_eq!(resource.lexicons.len(), 1);
@@ -78,7 +82,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_pronunciation() {
-        let result = parse_lmf(LMF_WITH_PRONUNCIATION).await;
+        let result = parse_lmf(LMF_WITH_PRONUNCIATION.to_string()).await;
         assert!(result.is_ok(), "Parsing failed: {:?}", result.err());
         let resource = result.unwrap();
         let lexicon = &resource.lexicons[0];
