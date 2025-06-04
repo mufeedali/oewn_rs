@@ -1,26 +1,28 @@
+//! XML parsing functionality for OEWN data.
+//!
+//! This module handles parsing the WN-LMF (WordNet Lexical Markup Framework)
+//! XML format into Rust data structures using the quick-xml crate.
+
 use crate::error::{OewnError, Result};
 use crate::models::LexicalResource;
 use log::debug;
 use quick_xml::de::from_str;
 use tokio::task;
 
-/// Parses WN-LMF XML content into a LexicalResource struct using spawn_blocking.
+/// Parses WN-LMF XML content into a LexicalResource struct.
 pub async fn parse_lmf(xml_content: String) -> Result<LexicalResource> {
     debug!("Starting WN-LMF XML parsing (using spawn_blocking)...");
-    // Wrap the synchronous parsing in spawn_blocking
-    let resource = task::spawn_blocking(move || -> Result<LexicalResource> {
-        from_str(&xml_content).map_err(OewnError::from) // Map quick_xml::DeError to OewnError
+    let resource: LexicalResource = task::spawn_blocking(move || -> Result<LexicalResource> {
+        from_str(&xml_content).map_err(OewnError::from)
     })
     .await??;
     debug!("Successfully parsed WN-LMF XML into LexicalResource.");
     Ok(resource)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Basic test with a minimal valid LMF structure
     const MINIMAL_LMF_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE LexicalResource SYSTEM "http://globalwordnet.github.io/schemas/WN-LMF-1.3.dtd">
 <LexicalResource xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -45,8 +47,10 @@ mod tests {
     async fn test_parse_minimal_lmf() {
         let result = parse_lmf(MINIMAL_LMF_XML.to_string()).await;
         assert!(result.is_ok(), "Parsing failed: {:?}", result.err());
+
         let resource = result.unwrap();
         assert_eq!(resource.lexicons.len(), 1);
+
         let lexicon = &resource.lexicons[0];
         assert_eq!(lexicon.id, "test-en");
         assert_eq!(lexicon.lexical_entries.len(), 1);
@@ -84,9 +88,11 @@ mod tests {
     async fn test_parse_pronunciation() {
         let result = parse_lmf(LMF_WITH_PRONUNCIATION.to_string()).await;
         assert!(result.is_ok(), "Parsing failed: {:?}", result.err());
+
         let resource = result.unwrap();
         let lexicon = &resource.lexicons[0];
         let entry = &lexicon.lexical_entries[0];
+
         assert_eq!(entry.pronunciations.len(), 2);
         assert_eq!(entry.pronunciations[0].variety, "en-GB-fonipa");
         assert_eq!(entry.pronunciations[0].text, "'ræbɪt");
@@ -94,7 +100,7 @@ mod tests {
             entry.pronunciations[0].audio,
             Some("http://example.com/rabbit.flac".to_string())
         );
-        assert!(entry.pronunciations[0].phonemic); // Default
+        assert!(entry.pronunciations[0].phonemic);
         assert_eq!(entry.pronunciations[1].variety, "en-US-fonipa");
         assert!(!entry.pronunciations[1].phonemic);
         assert_eq!(entry.pronunciations[1].audio, None);

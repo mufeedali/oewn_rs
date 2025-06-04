@@ -1,4 +1,23 @@
-// Declare modules
+//! Open English WordNet (OEWN) Rust library
+//!
+//! This library provides a Rust interface for accessing and querying the Open English WordNet database.
+//! It automatically downloads the latest OEWN data, processes it into an efficient SQLite database,
+//! and provides a convenient API for word lookups and relationships.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use oewn_rs::{WordNet, PartOfSpeech};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let wn = WordNet::load().await?;
+//!     let entries = wn.lookup_entries("rust", Some(PartOfSpeech::N))?;
+//!     println!("Found {} entries for 'rust' as a noun", entries.len());
+//!     Ok(())
+//! }
+//! ```
+
 pub mod data;
 pub mod db;
 pub mod error;
@@ -6,41 +25,48 @@ pub mod models;
 pub mod parse;
 pub mod progress;
 
-// Re-export key types for easier use
+use crate::db::{string_to_part_of_speech, string_to_sense_rel_type, string_to_synset_rel_type};
+use crate::progress::{
+    ProgressCallback, ProgressUpdate, create_progress_channel, report_progress_non_blocking,
+};
+use directories_next::ProjectDirs;
 pub use error::{OewnError, Result};
+use log::{debug, error, info, warn};
 pub use models::{
-    Definition,
-    Example,
-    ILIDefinition,
-    Lemma,
-    LexicalEntry,
-    LexicalResource,
-    Lexicon,
-    PartOfSpeech,
-    Pronunciation,
-    Sense,
-    SenseRelType,
-    SenseRelation,
-    Synset,
-    SynsetRelType,
+    Definition, Example, ILIDefinition, Lemma, LexicalEntry, LexicalResource, Lexicon,
+    PartOfSpeech, Pronunciation, Sense, SenseRelType, SenseRelation, Synset, SynsetRelType,
     SynsetRelation,
 };
-use crate::progress::{ProgressCallback, ProgressUpdate};
-
-use crate::db::{string_to_part_of_speech, string_to_sense_rel_type, string_to_synset_rel_type};
-use directories_next::ProjectDirs;
-use log::{debug, error, info, warn};
 use parse::parse_lmf;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params}; // Import rusqlite types
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex}; // Use Mutex for interior mutability of Connection
+use std::sync::{Arc, Mutex};
 
-// --- Constants ---
+const DB_CACHE_SIZE: i32 = -64000; // 64MB
 
-// --- Processed Data Structure ---
+/// Opens a database connection with optimized performance settings.
+///
+/// This function creates the parent directory if needed and configures the SQLite
+/// connection with performance optimizations including WAL mode, increased cache size,
+/// and memory-mapped I/O.
+fn open_db_connection(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(OewnError::Io)?;
+    }
 
-// --- WordNet Struct ---
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )?;
+
+    // Configure SQLite for optimal performance
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "cache_size", DB_CACHE_SIZE)?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+
+    Ok(conn)
+}
 
 /// Options for loading WordNet data.
 #[derive(Debug, Default, Clone)]
@@ -53,64 +79,75 @@ pub struct LoadOptions {
     pub force_reload: bool,
 }
 
-/// The main WordNet interface.
-#[derive(Clone)] // Clone is cheap due to Arc<Mutex<...>>
+/// The main WordNet interface providing access to lexical data.
+///
+/// This struct wraps a SQLite database connection and provides methods for
+/// querying word definitions, relationships, and other lexical information.
+/// The connection is thread-safe through Arc<Mutex<Connection>>.
+#[derive(Clone)]
 pub struct WordNet {
-    // Use Arc<Mutex<>> for thread-safe access to the connection if WordNet needs to be Send + Sync
     conn: Arc<Mutex<Connection>>,
 }
-
-// Helper function to open/create the database connection
-// This encapsulates the logic of setting flags and pragmas
-fn open_db_connection(path: &Path) -> Result<Connection> {
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(OewnError::Io)?;
-    }
-    // Open the connection with flags for read/write/create
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-    )?;
-
-    // Optimize connection for performance (optional but recommended)
-    // Use WAL mode for better concurrency (readers don't block writers)
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    // Increase cache size (adjust based on available memory and testing)
-    conn.pragma_update(None, "cache_size", "-64000")?; // e.g., -64000 = 64MB
-    // Use memory-mapped I/O (can improve performance, adjust size)
-    // conn.pragma_update(None, "mmap_size", 268435456)?; // e.g., 256MB
-    // Synchronous off can be faster but less safe on power loss (use NORMAL or FULL for safety)
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-
-    Ok(conn)
-}
-
 impl WordNet {
-    /// Loads the WordNet data using default options (automatic database path) and no progress reporting.
+    /// Loads the WordNet data using default options.
     ///
-    /// Ensures data is downloaded/extracted if needed.
-    /// Opens/creates the database, initializes schema, and populates from XML if necessary.
+    /// This is a convenience method that uses the default database path and
+    /// no progress reporting. For more control, use `load_with_options`.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the initialized `WordNet` instance or an error.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use oewn_rs::WordNet;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let wn = WordNet::load().await?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn load() -> Result<Self> {
-        Self::load_with_options(LoadOptions::default(), None).await // Pass None for callback
+        Self::load_with_options(LoadOptions::default(), None).await
     }
 
-    /// Loads the WordNet data with specific options and an optional progress callback.
+    /// Loads the WordNet data with specific options and optional progress callback.
+    ///
+    /// This method handles downloading OEWN data if needed, setting up the database,
+    /// and populating it with parsed XML data.
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - Configuration options for loading
+    /// * `progress_callback` - Optional callback for progress updates
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the initialized `WordNet` instance or an error.
     pub async fn load_with_options(
         options: LoadOptions,
-        progress_callback: Option<ProgressCallback>, // Keep original parameter type
+        progress_callback: Option<ProgressCallback>,
     ) -> Result<Self> {
-        // Wrap the callback in Arc<Mutex<Option<...>>> for safe sharing across async/sync boundaries
-        let reporter = Arc::new(Mutex::new(progress_callback));
+        // Create a channel for internal progress reporting
+        let (progress_reporter, mut progress_receiver) = create_progress_channel(100);
 
-        // Helper closure to simplify reporting
+        // Spawn a task to handle progress updates if a callback is provided
+        let _progress_handle = progress_callback.map(|mut callback| {
+            tokio::spawn(async move {
+                while let Some(update) = progress_receiver.recv().await {
+                    if !callback(update) {
+                        break;
+                    }
+                }
+            })
+        });
+
         let report = |update: ProgressUpdate| {
-            if let Some(cb) = reporter.lock().unwrap().as_mut() {
-                let _ = cb(update); // Ignore return value for now
-            }
+            report_progress_non_blocking(&progress_reporter, update);
         };
 
-        // 1. Determine database file path
         let db_path = match options.db_path {
             Some(path) => {
                 info!("Using provided database path: {:?}", path);
@@ -123,17 +160,10 @@ impl WordNet {
         let db_exists = db_path.exists();
         let mut needs_population = !db_exists || options.force_reload;
 
-        // 2. Open/Create Database Connection
         let mut conn = open_db_connection(&db_path)?;
 
-        // 3. Initialize Schema (creates tables/indices if they don't exist)
-        // This also checks/updates the schema version metadata.
-        // If the schema is old, it currently just warns and updates the version number.
-        // A real migration strategy would be needed for schema changes.
         db::initialize_database(&mut conn)?;
 
-        // 4. Check if population is needed (beyond just file existence/force_reload)
-        // We can check if a core table (e.g., lexicons) is empty.
         if !needs_population {
             let lexicon_count: i64 =
                 conn.query_row("SELECT COUNT(*) FROM lexicons", [], |row| row.get(0))?;
@@ -145,81 +175,84 @@ impl WordNet {
             }
         }
 
-        // 5. Populate database if needed
         if needs_population {
             if options.force_reload && db_exists {
-                info!(
-                    "Force reload requested. Clearing existing database data before population..."
-                );
-                // Use a transaction to clear data efficiently
+                info!("Force reload requested. Clearing existing database data...");
                 let tx = conn.transaction()?;
                 db::clear_database_data(&tx)?;
-                tx.commit()?; // Commit the clearing transaction
+                tx.commit()?;
                 info!("Existing data cleared.");
             } else {
                 info!("Database needs population (first run or empty).");
             }
 
-            // Ensure raw XML data file is present, passing the reporter Arc
-            let xml_path = data::ensure_data(reporter.clone()).await?; // Pass Arc clone
+            let xml_path = data::ensure_data(Some(progress_reporter.clone())).await?;
             info!("OEWN XML data available at: {:?}", xml_path);
 
-            // --- Read XML File ---
             let read_stage = "Reading XML file".to_string();
             info!("Reading XML file: {:?}", xml_path);
-            report(ProgressUpdate::new_stage(read_stage.clone(), None)); // Indeterminate start
+            report(ProgressUpdate::new(read_stage.clone(), 0, None, None));
             let xml_content = tokio::fs::read_to_string(&xml_path).await?;
-            report(ProgressUpdate { // Indicate completion
+            report(ProgressUpdate {
                 stage_description: read_stage,
                 current_item: 1,
                 total_items: Some(1),
                 message: Some("Read complete.".to_string()),
             });
 
-            // --- Parse XML Data ---
             let parse_stage = "Parsing XML data".to_string();
             info!("Parsing XML data...");
-            report(ProgressUpdate::new_stage(parse_stage.clone(), None)); // Indeterminate start
-            let resource = parse_lmf(xml_content).await?; // Pass owned String
-            report(ProgressUpdate { // Indicate completion
+            report(ProgressUpdate::new(parse_stage.clone(), 0, None, None));
+            let resource = parse_lmf(xml_content).await?;
+            report(ProgressUpdate {
                 stage_description: parse_stage,
                 current_item: 1,
                 total_items: Some(1),
                 message: Some("Parsing complete.".to_string()),
             });
 
-            // --- Populate Database ---
-            // populate_database handles its own transaction and progress reporting internally
-            // Pass the reporter Arc clone.
-            db::populate_database(&mut conn, resource, reporter.clone())?; // Pass Arc clone
+            db::populate_database(&mut conn, resource, Some(progress_reporter.clone()))?;
         } else {
             info!("Using existing populated database: {:?}", db_path);
         }
 
         Ok(WordNet {
-            conn: Arc::new(Mutex::new(conn)), // Wrap connection in Arc<Mutex>
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
     /// Gets the default path for the SQLite database file.
+    ///
+    /// The path is constructed using the user's data directory and includes
+    /// the OEWN version in the filename for proper versioning.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the default database path or an error if the
+    /// data directory cannot be determined.
     pub fn get_default_db_path() -> Result<PathBuf> {
         let project_dirs = ProjectDirs::from("org", "OewnRs", data::OEWN_SUBDIR)
             .ok_or(OewnError::DataDirNotFound)?;
-        // Use data_dir instead of cache_dir for the database
         let data_dir = project_dirs.data_dir();
-        fs::create_dir_all(data_dir)?; // Ensure the directory exists
-        let db_filename = format!(
-            "oewn-{}.db", // Simpler filename for the DB
-            data::OEWN_VERSION,
-            // Schema version is now stored inside the DB (metadata table)
-        );
+        fs::create_dir_all(data_dir)?;
+        let db_filename = format!("oewn-{}.db", data::OEWN_VERSION);
         Ok(data_dir.join(db_filename))
     }
 
     /// Clears the WordNet database file(s).
     ///
-    /// If `db_path_override` is `Some`, it attempts to delete that specific file.
-    /// If `db_path_override` is `None`, it calculates the default database path and attempts to delete that file.
+    /// This method removes the specified database file or the default database file
+    /// if no path is provided. It also attempts to clean up related SQLite files
+    /// (WAL and SHM files).
+    ///
+    /// # Arguments
+    ///
+    /// * `db_path_override` - Optional specific database file path to clear.
+    ///   If `None`, the default database path is used.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or failure of the operation.
     pub fn clear_database(db_path_override: Option<PathBuf>) -> Result<()> {
         let path_to_clear = match db_path_override {
             Some(path) => {
@@ -237,19 +270,10 @@ impl WordNet {
         };
 
         if path_to_clear.exists() {
-            // Attempt to delete the main database file
             match std::fs::remove_file(&path_to_clear) {
                 Ok(_) => {
                     info!("Successfully deleted database file: {:?}", path_to_clear);
-                    // Also attempt to delete WAL and SHM files if they exist
-                    let wal_path = path_to_clear.with_extension("db-wal");
-                    let shm_path = path_to_clear.with_extension("db-shm");
-                    if wal_path.exists() {
-                        let _ = std::fs::remove_file(wal_path); // Ignore error if deletion fails
-                    }
-                    if shm_path.exists() {
-                        let _ = std::fs::remove_file(shm_path); // Ignore error if deletion fails
-                    }
+                    Self::clean_sqlite_auxiliary_files(&path_to_clear);
                     Ok(())
                 }
                 Err(e) => {
@@ -262,20 +286,61 @@ impl WordNet {
                 "Database file not found, nothing to clear: {:?}",
                 path_to_clear
             );
-            Ok(()) // Not an error if the file doesn't exist
+            Ok(())
+        }
+    }
+
+    /// Cleans up auxiliary SQLite files (WAL and SHM).
+    fn clean_sqlite_auxiliary_files(db_path: &Path) {
+        let wal_path = db_path.with_extension("db-wal");
+        let shm_path = db_path.with_extension("db-shm");
+
+        if wal_path.exists() {
+            let _ = std::fs::remove_file(wal_path);
+        }
+        if shm_path.exists() {
+            let _ = std::fs::remove_file(shm_path);
         }
     }
 
     /// Clears the default WordNet database file.
+    ///
+    /// This is a convenience method that calls `clear_database(None)`.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or failure of the operation.
     pub fn clear_default_database() -> Result<()> {
         Self::clear_database(None)
     }
 
-    // --- Query Methods ---
-
-    /// Looks up lexical entries (including pronunciations, senses, and sense relations) for a given lemma,
-    /// optionally filtering by PartOfSpeech, using a single optimized query.
-    /// Returns owned LexicalEntry structs fetched from the DB.
+    /// Looks up lexical entries for a given lemma with optional part-of-speech filtering.
+    ///
+    /// This method performs an optimized single-query lookup that includes pronunciations,
+    /// senses, and sense relations. The lookup is case-insensitive.
+    ///
+    /// # Arguments
+    ///
+    /// * `lemma` - The word to look up
+    /// * `pos_filter` - Optional part-of-speech filter to narrow results
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing a vector of `LexicalEntry` structs or an error.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use oewn_rs::{WordNet, PartOfSpeech};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let wn = WordNet::load().await?;
+    ///     let entries = wn.lookup_entries("run", Some(PartOfSpeech::V))?;
+    ///     println!("Found {} verb entries for 'run'", entries.len());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn lookup_entries(
         &self,
         lemma: &str,
@@ -445,10 +510,9 @@ impl WordNet {
     /// Retrieves a specific Synset by its ID string.
     /// Returns an owned Synset struct fetched from the DB.
     pub fn get_synset(&self, id: &str) -> Result<Synset> {
-        let conn_guard = self
-            .conn
-            .lock()
-            .map_err(|_| OewnError::Internal("Mutex poisoned".to_string()))?;
+        let Ok(conn_guard) = self.conn.lock() else {
+            return Err(OewnError::Internal("Mutex poisoned".to_string()));
+        };
         self.fetch_full_synset_by_id(&conn_guard, id)?
             .ok_or_else(|| OewnError::SynsetNotFound(id.to_string()))
     }
@@ -508,7 +572,7 @@ impl WordNet {
             // Create or get the Sense struct from the map
             let sense_entry = senses_map.entry(sense_id.clone()).or_insert_with(|| Sense {
                 id: sense_id.clone(),
-                synset: current_synset_id, // Use the value from the row
+                synset: current_synset_id,   // Use the value from the row
                 sense_relations: Vec::new(), // Initialize relations vector
             });
 

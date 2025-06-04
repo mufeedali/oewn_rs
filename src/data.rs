@@ -1,5 +1,10 @@
+//! Data download and management for OEWN.
+//!
+//! This module handles downloading the OEWN XML data from GitHub releases,
+//! caching it locally, and decompressing it as needed.
+
 use crate::error::{OewnError, Result};
-use crate::progress::{ProgressCallback, ProgressUpdate};
+use crate::progress::{ProgressReporter, ProgressUpdate, report_progress_async};
 use directories_next::ProjectDirs;
 use flate2::read::GzDecoder;
 use futures::StreamExt;
@@ -7,142 +12,159 @@ use log::info;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
-// --- Constants ---
-pub const OEWN_VERSION: &str = "2024"; // Current version we are targeting
-pub const OEWN_SUBDIR: &str = "oewn-rs"; // Subdirectory within user's data dir
+/// OEWN version being targeted
+pub const OEWN_VERSION: &str = "2024";
+/// Subdirectory name within user's data directory
+pub const OEWN_SUBDIR: &str = "oewn-rs";
 const OEWN_FILENAME_GZ: &str = "english-wordnet-2024.xml.gz";
 const OEWN_FILENAME_XML: &str = "english-wordnet-2024.xml";
 const OEWN_DOWNLOAD_URL: &str = "https://github.com/globalwordnet/english-wordnet/releases/download/2024-edition/english-wordnet-2024.xml.gz";
 
-// --- Helper Functions ---
-
 /// Gets the project's data directory path.
+/// Creates the directory if it doesn't exist.
 fn get_data_dir() -> Result<PathBuf> {
     let proj_dirs =
         ProjectDirs::from("org", "OewnRs", OEWN_SUBDIR).ok_or(OewnError::DataDirNotFound)?;
     let data_dir = proj_dirs.data_dir().to_path_buf();
-    // Ensure the directory exists
     fs::create_dir_all(&data_dir)?;
     Ok(data_dir)
 }
 
-/// Downloads a file from a URL to a specified path using streaming, with progress reporting.
+/// Downloads a file from a URL to a specified path using streaming with progress reporting.
 async fn download_file(
     url: &str,
     dest_path: &Path,
-    reporter: Arc<Mutex<Option<ProgressCallback>>>,
+    reporter: Option<ProgressReporter>,
 ) -> Result<()> {
     let stage_desc = "Downloading OEWN data".to_string();
-    // Helper to call the callback inside the Arc<Mutex<>>
-    let report = |update: ProgressUpdate| {
-        if let Some(cb) = reporter.lock().unwrap().as_mut() {
-            let _ = cb(update);
-        }
-    };
 
     info!(
         "Downloading data from {} to {:?} (streaming)...",
         url, dest_path
     );
-    let response = reqwest::get(url).await?.error_for_status()?; // Check for HTTP errors
+    let response = reqwest::get(url).await?.error_for_status()?;
 
-    // Get total size from headers, if available
     let total_size = response.content_length();
-    report(ProgressUpdate::new_stage(stage_desc.clone(), total_size));
+
+    if let Some(ref reporter) = reporter {
+        report_progress_async(
+            reporter,
+            ProgressUpdate::new(stage_desc.clone(), 0, total_size, None),
+        )
+        .await;
+    }
 
     let mut dest_file = BufWriter::new(File::create(dest_path)?);
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = 0;
 
     while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result?; // Propagate potential stream errors
+        let chunk = chunk_result?;
         dest_file.write_all(&chunk)?;
         downloaded += chunk.len() as u64;
-        report(ProgressUpdate {
-            stage_description: stage_desc.clone(),
-            current_item: downloaded,
-            total_items: total_size,
-            message: None, // Could add bytes/sec here later
-        });
+
+        if let Some(ref reporter) = reporter {
+            report_progress_async(
+                reporter,
+                ProgressUpdate {
+                    stage_description: stage_desc.clone(),
+                    current_item: downloaded,
+                    total_items: total_size,
+                    message: None,
+                },
+            )
+            .await;
+        }
     }
 
-    dest_file.flush()?; // Ensure all data is written to disk
+    dest_file.flush()?;
 
-    // Final update to ensure 100% is shown if total_size was known
-    if let Some(total) = total_size {
-        report(ProgressUpdate {
-            stage_description: stage_desc.clone(),
-            current_item: total, // Set to total
-            total_items: Some(total),
-            message: Some("Download complete.".to_string()),
-        });
-    } else {
-        // If size was unknown, just send a final message
-         report(ProgressUpdate {
-            stage_description: stage_desc.clone(),
-            current_item: downloaded, // Final downloaded amount
-            total_items: None,
-            message: Some("Download complete.".to_string()),
-        });
+    if let Some(ref reporter) = reporter {
+        if let Some(total) = total_size {
+            report_progress_async(
+                reporter,
+                ProgressUpdate {
+                    stage_description: stage_desc.clone(),
+                    current_item: total,
+                    total_items: Some(total),
+                    message: Some("Download complete.".to_string()),
+                },
+            )
+            .await;
+        } else {
+            report_progress_async(
+                reporter,
+                ProgressUpdate {
+                    stage_description: stage_desc.clone(),
+                    current_item: downloaded,
+                    total_items: None,
+                    message: Some("Download complete.".to_string()),
+                },
+            )
+            .await;
+        }
     }
 
     info!("Download complete.");
     Ok(())
 }
 
-/// Decompresses a GZipped file, with progress reporting.
-fn decompress_gz(
+/// Decompresses a GZipped file with progress reporting.
+async fn decompress_gz(
     gz_path: &Path,
     dest_path: &Path,
-    reporter: Arc<Mutex<Option<ProgressCallback>>>,
+    reporter: Option<ProgressReporter>,
 ) -> Result<()> {
     let stage_desc = "Decompressing OEWN data".to_string();
-    // Helper to call the callback inside the Arc<Mutex<>>
-    let report = |update: ProgressUpdate| {
-        if let Some(cb) = reporter.lock().unwrap().as_mut() {
-            let _ = cb(update);
-        }
-    };
 
     info!("Decompressing {:?} to {:?}...", gz_path, dest_path);
-    report(ProgressUpdate::new_stage(stage_desc.clone(), None)); // Indeterminate
 
-    let gz_file = File::open(gz_path)?;
-    let mut decoder = GzDecoder::new(BufReader::new(gz_file));
-    let mut dest_file = BufWriter::new(File::create(dest_path)?);
+    if let Some(ref reporter) = reporter {
+        report_progress_async(
+            reporter,
+            ProgressUpdate::new(stage_desc.clone(), 0, None, None),
+        )
+        .await;
+    }
 
-    // Note: io::copy doesn't easily support progress reporting on bytes copied
-    // for decompression without a custom reader wrapper.
-    // For now, we just report start and end.
-    io::copy(&mut decoder, &mut dest_file)?;
-    dest_file.flush()?; // Ensure all data is written
+    let gz_path = gz_path.to_path_buf();
+    let dest_path = dest_path.to_path_buf();
 
-    report(ProgressUpdate {
-        stage_description: stage_desc.clone(),
-        current_item: 1, // Indicate completion (1 out of 1 step)
-        total_items: Some(1),
-        message: Some("Decompression complete.".to_string()),
-    });
+    tokio::task::spawn_blocking(move || {
+        let gz_file = File::open(&gz_path)?;
+        let mut decoder = GzDecoder::new(BufReader::new(gz_file));
+        let mut dest_file = BufWriter::new(File::create(&dest_path)?);
+        io::copy(&mut decoder, &mut dest_file)?;
+        dest_file.flush()?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await??;
+
+    if let Some(ref reporter) = reporter {
+        report_progress_async(
+            reporter,
+            ProgressUpdate {
+                stage_description: stage_desc.clone(),
+                current_item: 1,
+                total_items: Some(1),
+                message: Some("Decompression complete.".to_string()),
+            },
+        )
+        .await;
+    }
+
     info!("Decompression complete.");
     Ok(())
 }
 
-// --- Public API ---
-
 /// Ensures the OEWN XML data file is present in the data directory.
-///
-/// Downloads and/or decompresses the data if necessary.
-/// Returns the path to the final `.xml` file.
-pub async fn ensure_data(
-    reporter: Arc<Mutex<Option<ProgressCallback>>>,
-) -> Result<PathBuf> {
+/// This function downloads and/or decompresses the data if necessary.
+pub async fn ensure_data(reporter: Option<ProgressReporter>) -> Result<PathBuf> {
     let data_dir = get_data_dir()?;
     let xml_path = data_dir.join(OEWN_FILENAME_XML);
     let gz_path = data_dir.join(OEWN_FILENAME_GZ);
 
-    // 1. Check if the final XML file already exists
     if xml_path.exists() {
         info!("Found existing OEWN XML data file: {:?}", xml_path);
         return Ok(xml_path);
@@ -150,19 +172,14 @@ pub async fn ensure_data(
         info!("OEWN XML data file not found at {:?}.", xml_path);
     }
 
-    // 2. Check if the compressed GZ file exists
     if !gz_path.exists() {
         info!("OEWN GZ archive not found at {:?}. Downloading...", gz_path);
-        // Download the GZ file, passing the reporter Arc
         download_file(OEWN_DOWNLOAD_URL, &gz_path, reporter.clone()).await?;
     } else {
         info!("Found existing OEWN GZ archive: {:?}", gz_path);
     }
 
-    // 3. Decompress the GZ file, passing the reporter Arc
-    // Decompression is synchronous, but we call it from an async context.
-    // Wrap in spawn_blocking if it becomes significantly long.
-    decompress_gz(&gz_path, &xml_path, reporter.clone())?;
+    decompress_gz(&gz_path, &xml_path, reporter).await?;
 
     // 4. Return the path to the decompressed XML file
     Ok(xml_path)
@@ -221,9 +238,9 @@ mod tests {
         create_dummy_gz(&gz_path, dummy_xml_content).expect("Failed to create dummy GZ");
         assert!(gz_path.exists());
         assert!(!xml_path.exists());
-        // Manually call decompress_gz as ensure_data would (need a dummy reporter)
-        let dummy_reporter = Arc::new(Mutex::new(None::<ProgressCallback>));
-        let decompress_result = decompress_gz(&gz_path, &xml_path, dummy_reporter);
+        // Manually call decompress_gz as ensure_data would (no reporter for test)
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let decompress_result = rt.block_on(decompress_gz(&gz_path, &xml_path, None));
         assert!(decompress_result.is_ok(), "Decompression failed");
         assert!(xml_path.exists());
         let decompressed_content = fs::read_to_string(&xml_path).unwrap();
@@ -243,8 +260,8 @@ mod tests {
         // Cleanup is handled by scopeguard dropping temp_dir
     }
 
-    #[test]
-    fn test_decompress_gz_basic() {
+    #[tokio::test]
+    async fn test_decompress_gz_basic() {
         let _ = env_logger::builder().is_test(true).try_init();
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let gz_path = temp_dir.path().join("test.xml.gz");
@@ -254,8 +271,7 @@ mod tests {
         create_dummy_gz(&gz_path, content).expect("Failed to create dummy GZ");
         assert!(gz_path.exists());
 
-        let dummy_reporter = Arc::new(Mutex::new(None::<ProgressCallback>));
-        let result = decompress_gz(&gz_path, &xml_path, dummy_reporter);
+        let result = decompress_gz(&gz_path, &xml_path, None).await;
         assert!(result.is_ok(), "Decompression failed: {:?}", result.err());
         assert!(xml_path.exists());
         let decompressed_content =

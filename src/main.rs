@@ -1,18 +1,23 @@
+//! Command-line interface for the Open English WordNet (OEWN) library.
+//!
+//! This CLI provides commands for looking up word definitions, viewing random words,
+//! and managing the WordNet database.
+
 use clap::{Parser, Subcommand};
 use colored::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{LevelFilter, debug, error, info, warn};
 use oewn_rs::{
-    LexicalEntry, LoadOptions, SenseRelType, Synset, SynsetRelType, WordNet, error::Result,
-    models::PartOfSpeech, progress::{ProgressCallback, ProgressUpdate},
+    LexicalEntry, LoadOptions, SenseRelType, Synset, SynsetRelType, WordNet,
+    error::Result,
+    models::PartOfSpeech,
+    progress::{ProgressCallback, ProgressUpdate},
 };
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-// --- CLI Argument Parsing ---
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Open English WordNet CLI", long_about = None)]
@@ -28,7 +33,7 @@ struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     force_reload: bool,
 
-    /// Set verbosity level (e.g., -v, -vv)
+    /// Set verbosity level (use -v, -vv, or -vvv for increasing verbosity)
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 }
@@ -48,51 +53,38 @@ enum Commands {
     ClearDb,
 }
 
-// --- Main Function ---
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // --- Setup Logging ---
-    let log_level = match cli.verbose {
-        0 => LevelFilter::Warn, // Default
+/// Sets up logging based on verbosity level.
+fn setup_logging(verbose: u8) {
+    let log_level = match verbose {
+        0 => LevelFilter::Warn,
         1 => LevelFilter::Info,
         2 => LevelFilter::Debug,
         _ => LevelFilter::Trace,
     };
+
     env_logger::Builder::new()
-        .filter(None, log_level) // Use None to apply filter to all modules
-        .format(|buf, record| {
-            // Simple format: [LEVEL] message
-            writeln!(buf, "[{}] {}", record.level(), record.args())
-        })
+        .filter(None, log_level)
+        .format(|buf, record| writeln!(buf, "[{}] {}", record.level(), record.args()))
         .init();
+}
 
-    // --- Load WordNet Data with Progress ---
-    info!("Loading WordNet data...");
+/// Creates a progress callback for displaying download and processing progress.
+fn create_progress_callback(
+    multi_progress: MultiProgress,
+    progress_bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
+) -> ProgressCallback {
+    Box::new(move |update: ProgressUpdate| {
+        let mut bars = progress_bars.lock().unwrap();
 
-    // Setup Indicatif progress bars
-    let multi_progress = MultiProgress::new();
-    let progress_bars = Arc::new(Mutex::new(HashMap::<String, ProgressBar>::new())); // Store bars by stage name
-
-    // Define the progress callback
-    let mp_clone = multi_progress.clone(); // Clone for use in the callback
-    let pb_map_clone = progress_bars.clone();
-    let callback: ProgressCallback = Box::new(move |update: ProgressUpdate| {
-        let mut bars = pb_map_clone.lock().unwrap(); // Lock the map
-
-        // Check if it's a new stage or an update
-        if update.current_item == 0 {
-            // New stage or start of existing stage
-            let pb = mp_clone.add(ProgressBar::new(update.total_items.unwrap_or(0)));
+        if update.current_item == 0 && !bars.contains_key(&update.stage_description) {
+            // Create new progress bar for this stage
+            let pb = multi_progress.add(ProgressBar::new(update.total_items.unwrap_or(0)));
             let style_template = if update.total_items.is_some() {
-                // Template with percentage, bar, count, message
                 "{prefix:>12.cyan.bold} [{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} ({percent}%) {msg}"
             } else {
-                // Template for spinners or unknown length
                 "{prefix:>12.cyan.bold} [{elapsed_precise}] {spinner} {msg}"
             };
+
             pb.set_style(
                 ProgressStyle::default_bar()
                     .template(style_template)
@@ -101,63 +93,73 @@ async fn main() -> Result<()> {
             );
             pb.set_prefix(update.stage_description.clone());
             pb.set_message(update.message.unwrap_or_default());
-            pb.enable_steady_tick(Duration::from_millis(100)); // Update interval
-            bars.insert(update.stage_description, pb); // Store the new bar
+            pb.enable_steady_tick(Duration::from_millis(100));
+            bars.insert(update.stage_description.clone(), pb);
         } else if let Some(pb) = bars.get(&update.stage_description) {
-            // Update existing stage
+            // Update existing progress bar
             pb.set_position(update.current_item);
             if let Some(msg) = update.message {
-                 pb.set_message(msg); // Update message if provided
+                pb.set_message(msg);
             }
-            // Finish the bar if it reaches the total
             if let Some(total) = update.total_items {
                 if update.current_item >= total {
-                    pb.finish_with_message("Done");
+                    pb.finish_and_clear();
                 }
             }
         }
-        // In the future, return false here to signal cancellation request
         true
-    });
+    })
+}
 
+/// Main entry point for the CLI application.
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    setup_logging(cli.verbose);
+
+    info!("Loading WordNet data...");
+
+    let multi_progress = MultiProgress::new();
+    let progress_bars = Arc::new(Mutex::new(HashMap::<String, ProgressBar>::new()));
+
+    let callback = create_progress_callback(multi_progress.clone(), progress_bars.clone());
 
     let load_options = LoadOptions {
         db_path: cli.db_path.as_ref().map(PathBuf::from),
         force_reload: cli.force_reload,
     };
 
-    // Spawn the loading operation into a separate task
-    let load_handle = tokio::spawn(async move {
-        WordNet::load_with_options(load_options, Some(callback)).await // Pass the callback
-    });
+    let load_handle =
+        tokio::spawn(async move { WordNet::load_with_options(load_options, Some(callback)).await });
 
-    // Await the result of the loading task
     let wn_result = load_handle.await.unwrap_or_else(|e| {
         eprintln!("Error awaiting loading task: {}", e);
-        std::process::exit(1); // Exit if the spawned task itself failed
+        std::process::exit(1);
     });
 
-    // Ensure all progress bars are finished and clear them
-    // This is important for a clean exit
-    multi_progress.clear().unwrap_or_else(|e| eprintln!("Error clearing progress bars: {}", e));
-
+    // Clean up progress bars
+    {
+        let bars = progress_bars.lock().unwrap();
+        for (_, pb) in bars.iter() {
+            pb.finish_and_clear();
+        }
+    }
+    drop(multi_progress); // Explicitly drop to ensure cleanup
+    std::io::stdout().flush().ok();
 
     let wn = match wn_result {
         Ok(wn) => {
             info!("WordNet data loaded successfully.");
-            // No need to print success here if progress bars show completion
             wn
         }
         Err(e) => {
             error!("Failed to load WordNet data: {}", e);
-            // Error message is already printed by the logger
-            eprintln!("{}", format!("Error: {}", e).red()); // Simple error for user
+            eprintln!("{}", format!("Error: {}", e).red());
             std::process::exit(1);
         }
     };
 
-
-    // --- Execute Command ---
     match cli.command {
         Commands::Define { word, pos } => {
             if let Err(e) = handle_define(&wn, &word, pos).await {
@@ -175,11 +177,9 @@ async fn main() -> Result<()> {
         }
         Commands::ClearDb => {
             info!("Clearing database...");
-            // Use the same logic as loading to determine which db path to clear
             let db_path_to_clear = if let Some(custom_path) = cli.db_path {
                 Some(PathBuf::from(custom_path))
             } else {
-                // Try to get default path, ignore error if it fails (e.g., dir not found yet)
                 WordNet::get_default_db_path().ok()
             };
 
@@ -196,9 +196,7 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
-// --- Command Handlers ---
-
+/// Handles the define command by looking up and displaying word definitions.
 async fn handle_define(wn: &WordNet, word: &str, pos_filter: Option<PartOfSpeech>) -> Result<()> {
     info!("Defining word: '{}', PoS filter: {:?}", word, pos_filter);
     let start_lookup = Instant::now();
@@ -214,7 +212,6 @@ async fn handle_define(wn: &WordNet, word: &str, pos_filter: Option<PartOfSpeech
         return Ok(());
     }
 
-    // Group entries by lemma form and part of speech for structured output
     let mut grouped_entries: HashMap<(String, PartOfSpeech), Vec<LexicalEntry>> = HashMap::new();
     for entry in entries {
         grouped_entries
@@ -223,17 +220,17 @@ async fn handle_define(wn: &WordNet, word: &str, pos_filter: Option<PartOfSpeech
             .push(entry);
     }
 
-    // Sort groups for consistent output
     let mut sorted_groups: Vec<_> = grouped_entries.into_iter().collect();
     sorted_groups.sort_by(|a, b| a.0.cmp(&b.0));
+
     for ((lemma_form, pos), entries_for_group) in sorted_groups {
         println!(
             "\n{} ~ {}",
             lemma_form.bold().cyan(),
-            pos.to_string().italic() // Italic for POS
+            pos.to_string().italic()
         );
 
-        // Print pronunciations (using the first entry in the group)
+        // Print pronunciations
         if let Some(first_entry) = entries_for_group.first() {
             if !first_entry.pronunciations.is_empty() {
                 print!("  Pronunciations: ");
@@ -247,14 +244,12 @@ async fn handle_define(wn: &WordNet, word: &str, pos_filter: Option<PartOfSpeech
         }
 
         let mut sense_counter = 1;
-        // Iterate through entries for the group
         for entry in entries_for_group {
             let senses = wn.get_senses_for_entry(&entry.id)?;
             for sense in senses {
                 let start_sense_processing = Instant::now();
                 match wn.get_synset(&sense.synset) {
                     Ok(synset) => {
-                        // Pass the current lemma_form and the owned synset
                         print_sense_details(wn, &lemma_form, &synset, sense_counter)?;
                         sense_counter += 1;
                         debug!(
@@ -278,45 +273,39 @@ async fn handle_define(wn: &WordNet, word: &str, pos_filter: Option<PartOfSpeech
     Ok(())
 }
 
-/// Helper function to print details for a single sense/synset combination.
+/// Prints details for a single sense/synset combination.
 fn print_sense_details(
     wn: &WordNet,
     current_lemma: &str,
     synset: &Synset,
     counter: usize,
 ) -> Result<()> {
-    // 1. Print Definition(s)
+    // Print definition(s)
     for def in &synset.definitions {
-        // Indent definition
         println!("  {}: {}", counter.to_string().bold(), def.text.trim());
     }
     if let Some(ili_def) = &synset.ili_definition {
-        println!("     ILI: {}", ili_def.text.trim().dimmed()); // Dim ILI definition
+        println!("     ILI: {}", ili_def.text.trim().dimmed());
     }
 
-    // 2. Print Examples (using synset.examples)
+    // Print examples
     if !synset.examples.is_empty() {
         for example in &synset.examples {
-            // Indent examples
             println!("        {}", example.text.trim().italic());
         }
     }
 
-    // 3. Print Synonyms (using refined logic with sense_to_entry_index)
+    // Print synonyms
     let start_synonyms = Instant::now();
     let member_senses = wn.get_senses_for_synset(&synset.id)?;
     let mut synonyms = Vec::new();
     for member_sense in member_senses {
-        // Use the helper method to find the entry ID
         if let Some(entry_id) = wn.get_entry_id_for_sense(&member_sense.id)? {
-            // Use the helper method to look up the entry
             if let Some(entry) = wn.get_entry_by_id(&entry_id)? {
-                // Add the lemma if it's not the one currently being defined
-                if entry.lemma.written_form != current_lemma {
-                    // Avoid duplicates
-                    if !synonyms.contains(&entry.lemma.written_form) {
-                        synonyms.push(entry.lemma.written_form.clone());
-                    }
+                if entry.lemma.written_form != current_lemma
+                    && !synonyms.contains(&entry.lemma.written_form)
+                {
+                    synonyms.push(entry.lemma.written_form.clone());
                 }
             } else {
                 warn!(
@@ -324,7 +313,7 @@ fn print_sense_details(
                     entry_id
                 );
             }
-        } // Error from get_entry_id_for_sense or get_entry_by_id is propagated by `?`
+        }
     }
     debug!(
         "Synonym lookup for synset {} took: {:?}",
@@ -333,32 +322,28 @@ fn print_sense_details(
     );
 
     if !synonyms.is_empty() {
-        // Sort synonyms alphabetically
         synonyms.sort();
         println!(
             "        {}: {}",
             "Synonyms".magenta(),
             synonyms.join(", ").green()
-        ); // Color label magenta
+        );
     }
 
-    // 4. Print selected relations (Antonyms, Hypernyms, Hyponyms)
-    // Pass the whole synset to print_relation for Antonym lookup across member senses
+    // Print selected relations
     print_relation(wn, synset, SenseRelType::Antonym, "Antonyms")?;
     print_relation(wn, synset, SynsetRelType::Hypernym, "Hypernyms")?;
     print_relation(wn, synset, SynsetRelType::Hyponym, "Hyponyms")?;
-    // Other relations can be added here by calling print_relation
 
-    println!(); // Add a blank line after each sense block
+    println!();
     Ok(())
 }
 
-/// Helper function to print lemmas for a specific relation type.
+/// Prints lemmas for a specific relation type.
 /// Handles both SenseRelations (like Antonym) and SynsetRelations (like Hypernym).
-/// For SenseRelations, it checks relations across *all* senses within the synset.
 fn print_relation(
     wn: &WordNet,
-    synset: &Synset, // Takes reference
+    synset: &Synset,
     rel_type: impl Into<RelTypeMarker>,
     label: &str,
 ) -> Result<()> {
@@ -368,22 +353,13 @@ fn print_relation(
 
     match rel_type_marker {
         RelTypeMarker::Sense(sense_rel) => {
-            // Iterate through ALL senses belonging to this synset
-            let member_senses = wn.get_senses_for_synset(&synset.id)?; // Returns Vec<Sense>
+            let member_senses = wn.get_senses_for_synset(&synset.id)?;
             for member_sense in member_senses {
-                // member_sense is Sense
-                // Get relations for *this specific member sense*
-                let related_target_senses = wn.get_related_senses(&member_sense.id, sense_rel)?; // Returns Vec<Sense>
+                let related_target_senses = wn.get_related_senses(&member_sense.id, sense_rel)?;
                 for target_sense in related_target_senses {
-                    // target_sense is Sense
-                    // Important: Ensure the target sense is NOT part of the current synset
-                    // (e.g., avoid listing members of the same synset as antonyms)
                     if target_sense.synset != synset.id {
-                        // Find the entry for this target sense
                         if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id)? {
-                            // Returns Result<Option<String>>
                             if let Some(entry) = wn.get_entry_by_id(&entry_id)? {
-                                // Returns Result<Option<LexicalEntry>>
                                 if !related_lemmas.contains(&entry.lemma.written_form) {
                                     related_lemmas.push(entry.lemma.written_form.clone());
                                 }
@@ -394,17 +370,12 @@ fn print_relation(
             }
         }
         RelTypeMarker::Synset(synset_rel) => {
-            let related_synsets = wn.get_related_synsets(&synset.id, synset_rel)?; // Returns Vec<Synset>
+            let related_synsets = wn.get_related_synsets(&synset.id, synset_rel)?;
             for target_synset in related_synsets {
-                // target_synset is Synset
-                // Get all lemmas associated with this target synset
-                let target_senses = wn.get_senses_for_synset(&target_synset.id)?; // Returns Vec<Sense>
+                let target_senses = wn.get_senses_for_synset(&target_synset.id)?;
                 for target_sense in target_senses {
-                    // target_sense is Sense
                     if let Some(entry_id) = wn.get_entry_id_for_sense(&target_sense.id)? {
-                        // Returns Result<Option<String>>
                         if let Some(entry) = wn.get_entry_by_id(&entry_id)? {
-                            // Returns Result<Option<LexicalEntry>>
                             if !related_lemmas.contains(&entry.lemma.written_form) {
                                 related_lemmas.push(entry.lemma.written_form.clone());
                             }
@@ -418,7 +389,6 @@ fn print_relation(
     if !related_lemmas.is_empty() {
         related_lemmas.sort();
         related_lemmas.dedup();
-        // Use magenta for relation labels, green for lemmas
         println!(
             "        {}: {}",
             label.magenta(),
@@ -435,7 +405,7 @@ fn print_relation(
     Ok(())
 }
 
-// Helper enum to dispatch between SenseRelType and SynsetRelType in print_relation
+// Helper enum to dispatch between SenseRelType and SynsetRelType
 enum RelTypeMarker {
     Sense(SenseRelType),
     Synset(SynsetRelType),
